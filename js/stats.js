@@ -1,10 +1,14 @@
-/* 골프 라운드 통계 계산 — 「골프 라운드 분석_v2.xlsx」 수식과 같은 정의를 쓴다.
- * 홀 데이터: { h, par, score(+/-), putts, tee: 'F'|'L'|'R', pen, fp(1st 퍼트 m), gir(직접 입력 1/0) }
+/* 골프 라운드 통계 계산 — 「골프 라운드 분석_v2.xlsx」의 수식과 같은 정의를 쓴다.
+ * 홀 데이터(v2 홀별입력과 같은 항목):
+ *   h 홀, par, dist 거리(m), hcp 핸디캡, score(+/-), fw FW 안착(1/0), miss 티샷 미스(L/R/H/S/-),
+ *   drive 티샷 거리(m), ong 온그린 타수, gir GIR 직접(1/0), putts, fp 1st 퍼트 거리(m),
+ *   gmiss 그린 미스(짧음/길음/좌/우/-), appr 어프로치 시작거리(m), bunker 벙커샷 수, sg 숏게임 성공(1/0), pen 벌타, memo
  */
 const GolfStats = (() => {
   const isNum = (v) => typeof v === "number" && !Number.isNaN(v);
   const sum = (a) => a.reduce((s, v) => s + v, 0);
   const avg = (a) => (a.length ? sum(a) / a.length : null);
+  const ratio = (n, d) => (d ? n / d : null);
 
   const DEFAULT_SETTINGS = {
     // 레이더 0점/100점 기준 (v2 기준값 시트와 동일)
@@ -17,7 +21,6 @@ const GolfStats = (() => {
       crisis: { label: "위기관리", metric: "18홀당 벌타+더블+ 초과타", zero: 12, full: 0 },
     },
     radarTarget: 70,
-    // 목표 (간편 기록 v1 기준값과 동일). low: 낮을수록 좋음
     targets: {
       strokes: { label: "평균 타수", v: 89, low: true, fmt: "1" },
       parlow: { label: "파 이하 홀 수", v: 6, low: false, fmt: "1" },
@@ -30,24 +33,31 @@ const GolfStats = (() => {
       pen: { label: "벌타", v: 2, low: true, fmt: "1" },
     },
   };
-  // 목표 지표가 18홀 기준인지(full) 상세 기록 기준인지(detail)
   const TARGET_BASIS = { strokes: "full", parlow: "full", dbl: "full", putts: "detail", p3: "detail", girp: "detail", fwp: "detail", scrp: "detail", pen: "detail" };
 
+  const missSide = (m) => {
+    const x = String(m || "").toUpperCase();
+    return x === "L" || x === "H" ? "L" : x === "R" || x === "S" ? "R" : null;
+  };
+
+  // GIR: 직접 입력 우선 → 온그린 타수 ≤ Par−2 → (둘 다 없으면) 타수−퍼트 ≤ Par−2
   function holeGir(h) {
     if (isNum(h.gir)) return h.gir ? 1 : 0;
-    if (isNum(h.putts) && isNum(h.par) && isNum(h.score)) return h.par + h.score - h.putts <= h.par - 2 ? 1 : 0;
+    if (!isNum(h.par)) return null;
+    if (isNum(h.ong)) return h.ong <= h.par - 2 ? 1 : 0;
+    if (isNum(h.putts) && isNum(h.score)) return h.par + h.score - h.putts <= h.par - 2 ? 1 : 0;
     return null;
   }
+  // 기록 확인: 온그린 타수 + 퍼트 ≠ 타수
+  const holeCheck = (h) => isNum(h.ong) && isNum(h.putts) && isNum(h.par) && isNum(h.score) && h.ong + h.putts !== h.par + h.score;
 
   function round(r) {
     const hs = (r.holes || []).filter((h) => isNum(h.score));
     const n = hs.length;
-    const parsOk = hs.every((h) => isNum(h.par));
-    const full = n === 18 && parsOk;
-    const s = (h) => h.score;
+    const full = n === 18 && hs.every((h) => isNum(h.par));
     const out = {
       id: r.id, date: r.date, year: Number(String(r.date).slice(0, 4)), course: r.course, holes: n, full,
-      over: sum(hs.map(s)),
+      over: sum(hs.map((h) => h.score)),
       strokes: full ? sum(hs.map((h) => h.par + h.score)) : null,
       front: full ? sum(hs.filter((h) => h.h <= 9).map((h) => h.par + h.score)) : null,
       back: full ? sum(hs.filter((h) => h.h > 9).map((h) => h.par + h.score)) : null,
@@ -66,41 +76,47 @@ const GolfStats = (() => {
       out.putts = sum(pt.map((h) => h.putts));
       out.p3 = pt.filter((h) => h.putts >= 3).length;
       out.p3loss = sum(pt.map((h) => Math.max(0, h.putts - 2)));
+      out.onep = pt.filter((h) => h.putts === 1).length;
       out.pph = out.putts / pt.length;
-      const g = pt.map(holeGir);
-      out.gir = sum(g.map((v) => v || 0));
-      out.girp = out.gir / pt.length;
-      const miss = pt.filter((h) => holeGir(h) === 0);
+      const gs = hs.map(holeGir).filter((g) => g !== null);
+      out.gir = sum(gs);
+      out.girp = ratio(out.gir, gs.length);
+      const miss = hs.filter((h) => holeGir(h) === 0);
       out.scrOp = miss.length;
       out.scrOk = miss.filter((h) => h.score <= 0).length;
-      out.scrp = miss.length ? out.scrOk / miss.length : null;
+      out.scrp = ratio(out.scrOk, miss.length);
       out.scrFail = out.scrOp - out.scrOk;
       const pens = hs.filter((h) => isNum(h.pen));
       out.pen = pens.length ? sum(pens.map((h) => h.pen)) : null;
-      const fps = hs.filter((h) => isNum(h.fp) && h.fp > 0).map((h) => h.fp);
-      out.fp = avg(fps);
+      out.fp = avg(hs.filter((h) => isNum(h.fp) && h.fp > 0).map((h) => h.fp));
       out.crisis = n ? ((out.pen || 0) + out.blow) * 18 / n : null;
+      const sgs = hs.filter((h) => isNum(h.sg));
+      out.sgp = ratio(sgs.filter((h) => h.sg === 1).length, sgs.length);
     }
-    const tees = hs.filter((h) => h.tee === "F" || h.tee === "L" || h.tee === "R");
-    out.fw = tees.filter((h) => h.tee === "F").length;
-    out.teeL = tees.filter((h) => h.tee === "L").length;
-    out.teeR = tees.filter((h) => h.tee === "R").length;
-    out.fwp = tees.length ? out.fw / tees.length : null;
-    for (const p of [3, 4, 5]) {
-      const a = hs.filter((h) => h.par === p).map(s);
-      out["p" + p + "avg"] = avg(a);
-    }
+    const fws = hs.filter((h) => isNum(h.fw) && (!isNum(h.par) || h.par > 3));
+    out.fw = fws.filter((h) => h.fw === 1).length;
+    out.fwp = ratio(out.fw, fws.length);
+    out.teeL = hs.filter((h) => missSide(h.miss) === "L").length;
+    out.teeR = hs.filter((h) => missSide(h.miss) === "R").length;
+    out.drive = avg(hs.filter((h) => isNum(h.drive) && h.drive > 0).map((h) => h.drive));
+    out.bunker = hs.some((h) => isNum(h.bunker)) ? sum(hs.filter((h) => isNum(h.bunker)).map((h) => h.bunker)) : null;
+    out.checks = hs.filter(holeCheck).map((h) => h.h);
+    for (const p of [3, 4, 5]) out["p" + p + "avg"] = avg(hs.filter((h) => h.par === p).map((h) => h.score));
     return out;
   }
 
   function radarScore(key, v, settings) {
     if (!isNum(v)) return null;
     const c = settings.radar[key];
-    const x = ((v - c.zero) / (c.full - c.zero)) * 100;
-    return Math.round(Math.max(0, Math.min(100, x)));
+    return Math.round(Math.max(0, Math.min(100, ((v - c.zero) / (c.full - c.zero)) * 100)));
   }
+  const radarOf = (list, settings) => {
+    const pick = (k) => avg(list.map((r) => r[k]).filter(isNum));
+    const raw = { fw: pick("fwp"), gir: pick("girp"), scr: pick("scrp"), pph: pick("pph"), fp: pick("fp"), crisis: pick("crisis") };
+    return { raw, score: Object.fromEntries(Object.keys(settings.radar).map((k) => [k, radarScore(k, raw[k], settings)])) };
+  };
 
-  // 최근 순위: 날짜 내림차순(같은 날짜면 나중에 입력한 것이 최근)
+  // 최근 순: 날짜 내림차순(같은 날짜면 나중에 입력한 것이 최근)
   function byRecent(list) {
     return list.map((x, i) => ({ x, i })).sort((a, b) => (a.x.date < b.x.date ? 1 : a.x.date > b.x.date ? -1 : b.i - a.i)).map((o) => o.x);
   }
@@ -113,52 +129,100 @@ const GolfStats = (() => {
     const pick = (list, k) => list.map((r) => r[k]).filter(isNum);
     const metric = (key) => {
       const list = TARGET_BASIS[key] === "full" ? fulls : dets;
-      const all = avg(pick(list, key));
-      const r5 = avg(pick(list.slice(0, 5), key));
-      const last = list.length ? list[0][key] : null;
-      return { all, r5, last, n: list.length };
+      return { all: avg(pick(list, key)), r5: avg(pick(list.slice(0, 5), key)), last: list.length ? list[0][key] : null, n: list.length };
     };
     const best = fulls.length ? fulls.reduce((b, r) => (r.strokes < b.strokes ? r : b)) : null;
-    // 레이더: 최근 상세 5라운드 평균 지표
     const d5 = dets.slice(0, 5);
-    const radarRaw = {
-      fw: avg(pick(d5, "fwp")), gir: avg(pick(d5, "girp")), scr: avg(pick(d5, "scrp")),
-      pph: avg(pick(d5, "pph")), fp: avg(pick(d5, "fp")), crisis: avg(pick(d5, "crisis")),
+    const loss = [["벌타", "pen"], ["3퍼트 손실타", "p3loss"], ["스크램블 실패(홀)", "scrFail"], ["더블+ 초과타", "blow"]]
+      .map(([label, k]) => ({ label, all: avg(pick(dets, k)), r5: avg(pick(d5, k)) }));
+    return {
+      rs, recent, fulls, dets, best, metric, loss,
+      radar: radarOf(d5, settings), radarAll: radarOf(dets, settings),
+      courses: new Set(rs.map((r) => r.course)).size,
+      tee: { L: sum(rs.map((r) => r.teeL)), R: sum(rs.map((r) => r.teeR)) },
     };
-    const radar = Object.fromEntries(Object.keys(settings.radar).map((k) => [k, radarScore(k, radarRaw[k], settings)]));
-    const loss = [
-      ["벌타", "pen"], ["3퍼트 손실타", "p3loss"], ["스크램블 실패(홀)", "scrFail"], ["더블+ 초과타", "blow"],
-    ].map(([label, k]) => ({ label, all: avg(pick(dets, k)), r5: avg(pick(d5, k)) }));
-    return { rs, recent, fulls, dets, best, metric, radar, radarRaw, loss, courses: new Set(rs.map((r) => r.course)).size };
   }
 
-  // 홀 단위 집계 (Par가 있는 모든 홀)
+  const agg = (hs) => ({
+    n: hs.length,
+    par: avg(hs.filter((h) => isNum(h.par)).map((h) => h.par)),
+    over: avg(hs.map((h) => h.score)),
+    strokes: avg(hs.filter((h) => isNum(h.par)).map((h) => h.par + h.score)),
+    parlow: ratio(hs.filter((h) => h.score <= 0).length, hs.length),
+    birdie: ratio(hs.filter((h) => h.score <= -1).length, hs.length),
+    parExact: ratio(hs.filter((h) => h.score === 0).length, hs.length),
+    bogey: ratio(hs.filter((h) => h.score === 1).length, hs.length),
+    double: ratio(hs.filter((h) => h.score === 2).length, hs.length),
+    triple: ratio(hs.filter((h) => h.score >= 3).length, hs.length),
+    dbl: ratio(hs.filter((h) => h.score >= 2).length, hs.length),
+    putts: avg(hs.filter((h) => isNum(h.putts)).map((h) => h.putts)),
+    pen: avg(hs.filter((h) => isNum(h.pen)).map((h) => h.pen)),
+  });
+
+  function allHoles(rounds) {
+    const out = [];
+    for (const r of rounds) for (const h of r.holes || []) if (isNum(h.score)) out.push({ ...h, rid: r.id, year: Number(String(r.date).slice(0, 4)) });
+    return out;
+  }
+
+  // 홀 단위 집계 (Par가 있는 홀)
   function holeLevel(rounds) {
-    const all = [];
-    for (const r of rounds) for (const h of r.holes || []) if (isNum(h.score) && isNum(h.par)) all.push({ ...h, year: Number(String(r.date).slice(0, 4)) });
-    const agg = (hs) => ({
-      n: hs.length,
-      par: avg(hs.map((h) => h.par)),
-      over: avg(hs.map((h) => h.score)),
-      strokes: avg(hs.map((h) => h.par + h.score)),
-      parlow: hs.length ? hs.filter((h) => h.score <= 0).length / hs.length : null,
-      bogey: hs.length ? hs.filter((h) => h.score === 1).length / hs.length : null,
-      dbl: hs.length ? hs.filter((h) => h.score >= 2).length / hs.length : null,
-      birdie: hs.length ? hs.filter((h) => h.score <= -1).length / hs.length : null,
-      parExact: hs.length ? hs.filter((h) => h.score === 0).length / hs.length : null,
-      double: hs.length ? hs.filter((h) => h.score === 2).length / hs.length : null,
-      triple: hs.length ? hs.filter((h) => h.score >= 3).length / hs.length : null,
-    });
-    const byPar = Object.fromEntries([3, 4, 5].map((p) => [p, agg(all.filter((h) => h.par === p))]));
-    const byHole = Array.from({ length: 18 }, (_, i) => agg(all.filter((h) => h.h === i + 1)));
+    const all = allHoles(rounds).filter((h) => isNum(h.par));
     const years = [...new Set(all.map((h) => h.year))].sort();
-    const byYearPar = years.map((y) => ({
-      year: y,
-      ...Object.fromEntries([3, 4, 5].map((p) => ["p" + p, agg(all.filter((h) => h.year === y && h.par === p)).over])),
-      all: agg(all.filter((h) => h.year === y)).over,
-    }));
-    return { total: agg(all), byPar, byHole, byYearPar };
+    return {
+      total: agg(all),
+      byPar: Object.fromEntries([3, 4, 5].map((p) => [p, agg(all.filter((h) => h.par === p))])),
+      byHole: Array.from({ length: 18 }, (_, i) => agg(all.filter((h) => h.h === i + 1))),
+      byYearPar: years.map((y) => ({
+        year: y,
+        ...Object.fromEntries([3, 4, 5].map((p) => ["p" + p, agg(all.filter((h) => h.year === y && h.par === p)).over])),
+        all: agg(all.filter((h) => h.year === y)).over,
+      })),
+    };
   }
 
-  return { DEFAULT_SETTINGS, TARGET_BASIS, round, analyze, holeLevel, holeGir, byRecent, isNum, avg, sum };
+  // v2 「상세분석」 시트와 같은 7개 블록. rid가 있으면 그 라운드만
+  function detailBlocks(rounds, rid) {
+    const hs = allHoles(rounds).filter((h) => !rid || h.rid === rid);
+    const P45 = hs.filter((h) => isNum(h.par) && h.par > 3);
+    const scr = (list) => {
+      const miss = list.filter((h) => holeGir(h) === 0);
+      return ratio(miss.filter((h) => h.score <= 0).length, miss.length);
+    };
+    const band = (list, k, lo, hi) => list.filter((h) => isNum(h[k]) && h[k] > lo && h[k] <= hi);
+    const fwIn = agg(P45.filter((h) => h.fw === 1)), fwOut = agg(P45.filter((h) => h.fw === 0));
+    return {
+      n: hs.length,
+      fw: { in: fwIn, out: fwOut, diff: isNum(fwIn.over) && isNum(fwOut.over) ? fwOut.over - fwIn.over : null },
+      gir: { hit: agg(hs.filter((h) => holeGir(h) === 1)), miss: agg(hs.filter((h) => holeGir(h) === 0)) },
+      fp: [["0~2m", 0, 2], ["2~5m", 2, 5], ["5~10m", 5, 10], ["10m 이상", 10, 999]].map(([l, a, b]) => {
+        const x = band(hs, "fp", a, b).filter((h) => isNum(h.putts));
+        return { l, n: x.length, putts: avg(x.map((h) => h.putts)), one: ratio(x.filter((h) => h.putts <= 1).length, x.length), three: ratio(x.filter((h) => h.putts >= 3).length, x.length) };
+      }),
+      par: [3, 4, 5].map((p) => ({ p, ...agg(hs.filter((h) => h.par === p)) })),
+      miss: (() => {
+        const tagged = hs.filter((h) => h.miss);
+        return [["왼쪽 (L)", "L"], ["오른쪽 (R)", "R"], ["훅 (H)", "H"], ["슬라이스 (S)", "S"], ["미스 없음 (-)", "-"]].map(([l, c]) => {
+          const x = tagged.filter((h) => String(h.miss).toUpperCase() === c);
+          return { l, n: x.length, share: ratio(x.length, tagged.length), over: avg(x.map((h) => h.score)), pen: avg(x.filter((h) => isNum(h.pen)).map((h) => h.pen)) };
+        });
+      })(),
+      hcp: [["핸디캡 1~6 (어려움)", 1, 6], ["핸디캡 7~12", 7, 12], ["핸디캡 13~18 (쉬움)", 13, 18]].map(([l, a, b]) => {
+        const x = hs.filter((h) => isNum(h.hcp) && h.hcp >= a && h.hcp <= b);
+        return { l, n: x.length, over: avg(x.map((h) => h.score)) };
+      }).concat([["전반 9홀", 1, 9], ["후반 9홀", 10, 18]].map(([l, a, b]) => {
+        const x = hs.filter((h) => h.h >= a && h.h <= b);
+        return { l, n: x.length, over: avg(x.map((h) => h.score)) };
+      })),
+      green: [["짧음", "짧음"], ["길음", "길음"], ["좌", "좌"], ["우", "우"]].map(([l, c]) => {
+        const x = hs.filter((h) => h.gmiss === c);
+        return { l: "그린 미스 " + l, n: x.length, over: avg(x.map((h) => h.score)), scr: null };
+      }).concat([["어프로치 10m 이내", 0, 10], ["어프로치 10~30m", 10, 30], ["어프로치 30m 이상", 30, 999]].map(([l, a, b]) => {
+        const x = band(hs, "appr", a, b);
+        return { l, n: x.length, over: avg(x.map((h) => h.score)), scr: scr(x) };
+      })),
+    };
+  }
+
+  return { DEFAULT_SETTINGS, TARGET_BASIS, round, analyze, holeLevel, detailBlocks, holeGir, holeCheck, byRecent, isNum, avg, sum };
 })();

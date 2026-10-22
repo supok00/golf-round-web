@@ -1,67 +1,43 @@
-/* 골프 라운드 분석 웹앱 — 화면 렌더링과 데이터 저장.
- * GitHub Pages는 서버가 없으므로 입력한 라운드는 이 브라우저(localStorage)에 저장한다.
- * 처음 열 때는 data/rounds.json(엑셀 v2에서 옮긴 기록)을 불러온다.
+/* 골프 라운드 분석 웹앱 — 화면 렌더링.
+ * 데이터 원본은 GitHub 저장소의 data/rounds.json, data/settings.json 이다(GitHubStore).
+ * 입력 중인 라운드만 이 브라우저에 임시 저장해, 저장 전에 화면이 닫혀도 잃지 않게 한다.
  */
 (() => {
   const S = GolfStats;
-  const KEY_ROUNDS = "golf.rounds.v1";
-  const KEY_SETTINGS = "golf.settings.v1";
+  const G = GitHubStore;
+  const KEY_DRAFT = "golf.draft.v2";
+  const KEY_CACHE = "golf.cache.v2";
   const app = document.getElementById("app");
   let rounds = [];
   let settings = structuredClone(S.DEFAULT_SETTINGS);
+  let source = "";
+  let loadedAt = null;
   let charts = [];
 
-  // ───────────── 저장 ─────────────
-  const store = {
-    get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
-    set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch { return false; } },
-    del(k) { try { localStorage.removeItem(k); } catch { /* 사파리 사생활 보호 모드 등 */ } },
-  };
-  function saveRounds() {
-    if (!store.set(KEY_ROUNDS, rounds)) toast("브라우저 저장소에 저장하지 못했습니다. 내보내기로 백업하세요.");
-  }
-  function saveSettings() { store.set(KEY_SETTINGS, settings); }
-  async function loadOriginal() {
-    const res = await fetch("data/rounds.json", { cache: "no-store" });
-    return res.json();
-  }
-  async function init() {
-    const saved = store.get(KEY_ROUNDS);
-    rounds = Array.isArray(saved) ? saved : await loadOriginal();
-    if (!Array.isArray(saved)) saveRounds();
-    const st = store.get(KEY_SETTINGS);
-    if (st) settings = deepMerge(structuredClone(S.DEFAULT_SETTINGS), st);
-    window.addEventListener("hashchange", route);
-    route();
-  }
-  function deepMerge(a, b) {
-    for (const k of Object.keys(b || {})) {
-      if (b[k] && typeof b[k] === "object" && !Array.isArray(b[k])) a[k] = deepMerge(a[k] || {}, b[k]);
-      else a[k] = b[k];
-    }
-    return a;
-  }
-
   // ───────────── 유틸 ─────────────
-  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const isNum = S.isNum;
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const f1 = (v) => (isNum(v) ? v.toFixed(1) : "-");
   const f2 = (v) => (isNum(v) ? v.toFixed(2) : "-");
   const pct = (v) => (isNum(v) ? Math.round(v * 100) + "%" : "-");
   const sgn = (v, d = 2) => (isNum(v) ? (v > 0 ? "+" : "") + v.toFixed(d) : "-");
   const fmtT = (v, t) => (t === "%" ? pct(v) : f1(v));
-  const dot = (d) => String(d).replaceAll("-", ".");
-  function toast(msg) {
+  const dot = (d) => String(d || "").replaceAll("-", ".");
+  const ls = {
+    get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* 저장 공간 없음 */ } },
+    del(k) { try { localStorage.removeItem(k); } catch { /* 무시 */ } },
+  };
+  function toast(msg, ms = 2800) {
     const t = document.getElementById("toast");
     t.textContent = msg;
     t.hidden = false;
     clearTimeout(toast._t);
-    toast._t = setTimeout(() => (t.hidden = true), 2600);
+    toast._t = setTimeout(() => (t.hidden = true), ms);
   }
   function chart(id, cfg) {
     const el = document.getElementById(id);
-    if (!el || !window.Chart) return;
-    charts.push(new Chart(el, cfg));
+    if (el && window.Chart) charts.push(new Chart(el, cfg));
   }
   // 차트 데이터 레이블: 값만 표시 (계열·항목 이름 없음)
   const valueLabels = (fmt) => ({
@@ -79,97 +55,133 @@
         meta.data.forEach((el, j) => {
           const v = ds.data[j];
           if (!isNum(v)) return;
-          const horizontal = c.options.indexAxis === "y";
-          const x = horizontal ? el.x + 18 : el.x;
-          const y = horizontal ? el.y + 4 : el.y - 6;
-          ctx.fillText(fmt(v), x, y);
+          const hz = c.options.indexAxis === "y";
+          ctx.fillText(fmt(v), hz ? el.x + 18 : el.x, hz ? el.y + 4 : el.y - 6);
         });
       });
       ctx.restore();
     },
   });
-  const baseOpts = (extra = {}) => ({
-    responsive: true,
-    maintainAspectRatio: false,
-    plugins: { legend: { display: false }, tooltip: { enabled: true } },
-    ...extra,
-  });
+  const baseOpts = (extra = {}) => ({ responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, ...extra });
+  const legendOn = { legend: { display: true, position: "bottom" } };
+  const noGrid = { grid: { display: false } };
+
+  // ───────────── 데이터 ─────────────
+  async function loadAll(quiet) {
+    try {
+      const r = await G.load();
+      if (Array.isArray(r.data)) {
+        rounds = r.data;
+        source = r.missing ? "pages" : r.source;
+        loadedAt = new Date();
+        ls.set(KEY_CACHE, rounds);
+      }
+      const s = await G.load("data/settings.json");
+      if (s.data) settings = deepMerge(structuredClone(S.DEFAULT_SETTINGS), s.data);
+      if (!quiet) toast(source === "github" ? "GitHub 최신 데이터를 불러왔습니다." : "배포본 데이터를 불러왔습니다(GitHub API 한도 초과 등).");
+    } catch (e) {
+      const cached = ls.get(KEY_CACHE);
+      if (Array.isArray(cached)) { rounds = cached; source = "cache"; }
+      toast("데이터를 불러오지 못했습니다: " + e.message, 5000);
+    }
+    renderStatus();
+  }
+  function deepMerge(a, b) {
+    for (const k of Object.keys(b || {})) {
+      if (b[k] && typeof b[k] === "object" && !Array.isArray(b[k])) a[k] = deepMerge(a[k] || {}, b[k]);
+      else a[k] = b[k];
+    }
+    return a;
+  }
+  function renderStatus() {
+    const el = document.getElementById("status");
+    if (!el) return;
+    const src = { github: "GitHub 최신본", pages: "배포본(최대 몇 분 늦을 수 있음)", cache: "이 기기 캐시(오프라인)" }[source] || "-";
+    el.innerHTML = `<span>데이터: ${src}${loadedAt ? " · " + loadedAt.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" }) : ""}</span>
+      <span class="${G.canWrite() ? "ok" : "muted"}">${G.canWrite() ? "● 저장 가능" : "○ 읽기 전용"}</span>
+      <button class="link" id="bReload" type="button">새로고침</button>`;
+    document.getElementById("bReload").onclick = async () => { await loadAll(); route(); };
+  }
+  async function commit(mutate, message) {
+    const next = await G.update((data) => mutate(Array.isArray(data) ? data : []), message);
+    rounds = next;
+    source = "github";
+    loadedAt = new Date();
+    ls.set(KEY_CACHE, rounds);
+    renderStatus();
+  }
 
   // ───────────── 라우팅 ─────────────
   function route() {
     charts.forEach((c) => c.destroy());
     charts = [];
-    const [, tab = "dashboard", arg] = location.hash.split("/");
-    document.querySelectorAll("#tabs a").forEach((a) => a.classList.toggle("active", a.dataset.tab === (tab === "round" || tab === "edit" ? "rounds" : tab)));
-    const views = { dashboard, input: () => inputView(null), edit: () => inputView(arg), rounds: roundsView, round: () => roundView(arg), stats: statsView, holes: holesView, settings: settingsView };
+    const [, tab = "dashboard", arg] = location.hash.split("?")[0].split("/");
+    const active = tab === "round" || tab === "edit" ? "rounds" : tab;
+    document.querySelectorAll("#tabs a").forEach((a) => a.classList.toggle("active", a.dataset.tab === active));
+    const views = { dashboard, input: () => inputView(null), edit: () => inputView(decodeURIComponent(arg || "")), rounds: roundsView, round: () => roundView(decodeURIComponent(arg || "")), stats: statsView, holes: holesView, detail: detailView, settings: settingsView };
     (views[tab] || dashboard)();
     window.scrollTo(0, 0);
   }
 
   // ───────────── 대시보드 ─────────────
+  function kpi(lbl, val, sub, cls = "") {
+    return `<div class="kpi"><div class="lbl">${lbl}</div><div class="val ${cls}">${val}</div><div class="sub">${sub || "&nbsp;"}</div></div>`;
+  }
   function dashboard() {
     const A = S.analyze(rounds, settings);
-    const r5 = A.fulls.slice(0, 5).map((r) => r.strokes);
     const rows = Object.entries(settings.targets).map(([k, t]) => {
       const m = A.metric(k);
-      const ok = isNum(m.r5) ? (t.low ? m.r5 <= t.v : m.r5 >= t.v) : null;
-      return { k, t, m, ok };
+      return { t, m, ok: isNum(m.r5) ? (t.low ? m.r5 <= t.v : m.r5 >= t.v) : null };
     });
     const okList = rows.filter((r) => r.ok === true).map((r) => r.t.label);
     const ngList = rows.filter((r) => r.ok === false).map((r) => r.t.label);
     const lossTop = A.loss.filter((l) => isNum(l.r5)).sort((a, b) => b.r5 - a.r5)[0];
     const H = S.holeLevel(rounds);
-    const parSorted = [3, 4, 5].filter((p) => isNum(H.byPar[p].over)).sort((a, b) => H.byPar[a].over - H.byPar[b].over);
-    const tl = A.teeTotals || A.rs.reduce((o, r) => ({ L: o.L + r.teeL, R: o.R + r.teeR }), { L: 0, R: 0 });
-    const frontAvg = S.avg(A.fulls.map((r) => r.front));
-    const backAvg = S.avg(A.fulls.map((r) => r.back));
+    const ps = [3, 4, 5].filter((p) => isNum(H.byPar[p].over)).sort((a, b) => H.byPar[a].over - H.byPar[b].over);
+    const fr = S.avg(A.fulls.map((r) => r.front)), bk = S.avg(A.fulls.map((r) => r.back));
     app.innerHTML = `
       <h2>요약</h2>
       <div class="kpis">
         ${kpi("등록 라운드", A.rs.length, `18홀 ${A.fulls.length}회`)}
         ${kpi("베스트 스코어", A.best ? A.best.strokes : "-", A.best ? `${dot(A.best.date)} ${esc(A.best.course)}` : "", "best")}
         ${kpi("평균 타수", f1(S.avg(A.fulls.map((r) => r.strokes))), "18홀 평균")}
-        ${kpi("최근 5R 평균", f1(S.avg(r5)), "최근 18홀 5라운드")}
+        ${kpi("최근 5R 평균", f1(S.avg(A.fulls.slice(0, 5).map((r) => r.strokes))), "최근 18홀 5라운드")}
         ${kpi("방문 골프장", A.courses, "서로 다른 골프장")}
       </div>
-
       <h2>실력 진단 <span class="muted">최근 5라운드 vs 목표</span></h2>
       <div class="tbl-wrap"><table>
         <thead><tr><th class="l">지표</th><th>전체 평균</th><th>최근 5R</th><th>직전 라운드</th><th>목표</th><th>판정</th></tr></thead>
         <tbody>${rows.map(({ t, m, ok }) => `<tr><td class="l"><b>${t.label}</b></td><td>${fmtT(m.all, t.fmt)}</td><td><b>${fmtT(m.r5, t.fmt)}</b></td><td>${fmtT(m.last, t.fmt)}</td><td class="muted">${fmtT(t.v, t.fmt)}</td><td>${ok === null ? "-" : `<span class="pill ${ok ? "ok" : "ng"}">${ok ? "달성" : "미달"}</span>`}</td></tr>`).join("")}</tbody>
       </table></div>
-      <p class="legend-note">타수 지표는 18홀 라운드(${A.fulls.length}회), 퍼트/GIR/FW/스크램블/벌타는 퍼트를 기록한 상세 라운드(${A.dets.length}회) 기준입니다. 목표는 설정에서 바꿀 수 있습니다.</p>
-
+      <p class="legend-note">타수 지표는 18홀 라운드(${A.fulls.length}회), 퍼트/GIR/FW/스크램블/벌타는 퍼트를 기록한 상세 라운드(${A.dets.length}회) 기준입니다.</p>
       <div class="grid g2" style="margin-top:12px">
-        <div class="card"><h3 style="margin-top:0">6영역 육각형 <span class="muted">최근 상세 5R</span></h3><div class="chart-box tall"><canvas id="cRadar"></canvas></div></div>
-        <div class="card"><h3 style="margin-top:0">라운드당 타수 손실 <span class="muted">최근 상세 5R</span></h3><div class="chart-box tall"><canvas id="cLoss"></canvas></div>
+        <div class="card"><h3 class="mt0">6영역 육각형 <span class="muted">최근 상세 5R vs 전체</span></h3><div class="chart-box tall"><canvas id="cRadar"></canvas></div></div>
+        <div class="card"><h3 class="mt0">라운드당 타수 손실 <span class="muted">최근 상세 5R</span></h3><div class="chart-box tall"><canvas id="cLoss"></canvas></div>
           <p class="legend-note">항목끼리 일부 겹칩니다(벌타 홀은 더블+가 되기 쉬움). 크기 비교로 연습 순서를 정하는 용도입니다.</p></div>
       </div>
-
       <h2>강점 · 약점</h2>
       <div class="card"><ul class="sw">
         <li><span class="ok">강점</span> ${okList.length ? "목표 달성: " + okList.join(", ") : "목표를 달성한 지표가 아직 없습니다"}</li>
         <li><span class="ng">약점</span> ${ngList.length ? "목표 미달: " + ngList.join(", ") : "모든 지표가 목표를 달성했습니다"}</li>
         ${lossTop ? `<li><span class="ng">1순위</span> 가장 많이 잃는 곳: ${lossTop.label} (최근 5R 라운드당 ${f1(lossTop.r5)}타)</li>` : ""}
-        ${parSorted.length ? `<li><b>파 유형</b> 파${parSorted[0]} 가장 안정(${sgn(H.byPar[parSorted[0]].over)}) / 파${parSorted.at(-1)} 가장 약함(${sgn(H.byPar[parSorted.at(-1)].over)}, 더블+ ${pct(H.byPar[parSorted.at(-1)].dbl)})</li>` : ""}
-        ${tl.L + tl.R ? `<li><b>티샷 미스</b> 왼쪽 ${tl.L}회 / 오른쪽 ${tl.R}회${tl.R >= 2 * tl.L ? " → 오른쪽 쏠림(슬라이스 계열) 점검" : tl.L >= 2 * tl.R ? " → 왼쪽 쏠림(훅 계열) 점검" : ""}</li>` : ""}
-        ${isNum(frontAvg) ? `<li><b>전·후반</b> 전반 평균 ${f1(frontAvg)} / 후반 평균 ${f1(backAvg)}</li>` : ""}
+        ${ps.length ? `<li><b>파 유형</b> 파${ps[0]} 가장 안정(${sgn(H.byPar[ps[0]].over)}) / 파${ps.at(-1)} 가장 약함(${sgn(H.byPar[ps.at(-1)].over)}, 더블+ ${pct(H.byPar[ps.at(-1)].dbl)})</li>` : ""}
+        ${A.tee.L + A.tee.R ? `<li><b>티샷 미스</b> 왼쪽(L·H) ${A.tee.L}회 / 오른쪽(R·S) ${A.tee.R}회${A.tee.R >= 2 * A.tee.L ? " → 오른쪽 쏠림(슬라이스 계열) 점검" : A.tee.L >= 2 * A.tee.R ? " → 왼쪽 쏠림(훅 계열) 점검" : ""}</li>` : ""}
+        ${isNum(fr) ? `<li><b>전·후반</b> 전반 평균 ${f1(fr)} / 후반 평균 ${f1(bk)}</li>` : ""}
       </ul></div>
-
       <h2>타수 추이 <span class="muted">최근 18홀 30라운드</span></h2>
-      <div class="card"><div class="chart-box tall"><canvas id="cTrend"></canvas></div></div>
-    `;
+      <div class="card"><div class="chart-box tall"><canvas id="cTrend"></canvas></div></div>`;
     const rk = Object.keys(settings.radar);
     chart("cRadar", {
       type: "radar",
       data: {
         labels: rk.map((k) => settings.radar[k].label),
         datasets: [
-          { label: "최근 5R", data: rk.map((k) => A.radar[k]), backgroundColor: "rgba(30,94,59,.25)", borderColor: "#1e5e3b", pointBackgroundColor: "#1e5e3b" },
-          { label: "목표", data: rk.map(() => settings.radarTarget), borderColor: "#f28c28", borderDash: [6, 4], backgroundColor: "transparent", pointRadius: 0, noLabels: true },
+          { label: "최근 5R", data: rk.map((k) => A.radar.score[k]), backgroundColor: "rgba(30,94,59,.25)", borderColor: "#1e5e3b", pointBackgroundColor: "#1e5e3b" },
+          { label: "전체 평균", data: rk.map((k) => A.radarAll.score[k]), borderColor: "#1f6fd6", backgroundColor: "transparent", pointRadius: 2 },
+          { label: "목표", data: rk.map(() => settings.radarTarget), borderColor: "#f28c28", borderDash: [6, 4], backgroundColor: "transparent", pointRadius: 0 },
         ],
       },
-      options: baseOpts({ plugins: { legend: { display: true, position: "bottom" } }, scales: { r: { min: 0, max: 100, ticks: { stepSize: 20, display: false }, pointLabels: { font: { size: 13, weight: "600" } } } } }),
+      options: baseOpts({ plugins: legendOn, scales: { r: { min: 0, max: 100, ticks: { stepSize: 20, display: false }, pointLabels: { font: { size: 13, weight: "600" } } } } }),
       plugins: [{
         id: "radarVals",
         afterDatasetsDraw(c) {
@@ -183,183 +195,221 @@
     chart("cLoss", {
       type: "bar",
       data: { labels: A.loss.map((l) => l.label), datasets: [{ data: A.loss.map((l) => l.r5), backgroundColor: "#e5352b" }] },
-      options: baseOpts({ indexAxis: "y", scales: { x: { beginAtZero: true, grid: { display: false } }, y: { grid: { display: false } } } }),
+      options: baseOpts({ indexAxis: "y", scales: { x: { beginAtZero: true, ...noGrid }, y: noGrid } }),
       plugins: [valueLabels(f1)],
     });
-    trendChart("cTrend", A);
-  }
-  function kpi(lbl, val, sub, cls = "") {
-    return `<div class="kpi"><div class="lbl">${lbl}</div><div class="val ${cls}">${val}</div><div class="sub">${sub || "&nbsp;"}</div></div>`;
-  }
-  function trendChart(id, A) {
-    const list = A.fulls.slice(0, 30).reverse();
-    const all = A.fulls.slice().reverse();
-    const ma = list.map((r) => {
-      const idx = all.indexOf(r);
-      const w = all.slice(Math.max(0, idx - 4), idx + 1).map((x) => x.strokes);
-      return S.avg(w);
-    });
-    chart(id, {
+    const list = A.fulls.slice(0, 30).reverse(), all = A.fulls.slice().reverse();
+    chart("cTrend", {
       type: "line",
       data: {
         labels: list.map((r) => r.date.slice(2).replaceAll("-", ".")),
         datasets: [
           { label: "총타수", data: list.map((r) => r.strokes), borderColor: "#e5352b", backgroundColor: "#e5352b", borderDash: [6, 4], pointRadius: 4, tension: 0 },
-          { label: "5R 이동평균", data: ma, borderColor: "#1f6fd6", pointRadius: 0, tension: 0.2, noLabels: true },
+          { label: "5R 이동평균", data: list.map((r) => { const i = all.indexOf(r); return S.avg(all.slice(Math.max(0, i - 4), i + 1).map((x) => x.strokes)); }), borderColor: "#1f6fd6", pointRadius: 0, tension: 0.2, noLabels: true },
         ],
       },
-      options: baseOpts({ plugins: { legend: { display: true, position: "bottom" } }, scales: { y: { suggestedMin: 75, suggestedMax: 110 }, x: { grid: { display: false } } } }),
+      options: baseOpts({ plugins: legendOn, scales: { y: { suggestedMin: 75, suggestedMax: 110 }, x: noGrid } }),
       plugins: [valueLabels((v) => v)],
     });
   }
 
-  // ───────────── 라운드 입력/수정 ─────────────
+  // ───────────── 라운드 입력 (v2 스코어카드 전 항목) ─────────────
+  // [키, 라벨, 종류, 옵션]
+  const FIELDS = [
+    ["기본", [["par", "Par", "sel", [3, 4, 5, 6]], ["score", "Score (+/-)", "sel", [-3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8]], ["putts", "Putts", "sel", [0, 1, 2, 3, 4, 5]], ["pen", "벌타", "sel", [0, 1, 2, 3, 4]]]],
+    ["코스 정보", [["dist", "거리 (m)", "num"], ["hcp", "핸디캡", "sel", Array.from({ length: 18 }, (_, i) => i + 1)]]],
+    ["티샷", [["fw", "FW 안착", "ox"], ["miss", "티샷 미스", "sel", ["L", "R", "H", "S", "-"]], ["drive", "티샷 거리 (m)", "num"]]],
+    ["그린", [["ong", "온그린 타수", "sel", [1, 2, 3, 4, 5, 6, 7, 8]], ["gir", "GIR 직접", "ox"], ["fp", "1st 퍼트 거리 (m)", "num"]]],
+    ["숏게임", [["gmiss", "그린 미스", "sel", ["짧음", "길음", "좌", "우", "-"]], ["appr", "어프로치 거리 (m)", "num"], ["bunker", "벙커샷 수", "sel", [0, 1, 2, 3, 4]], ["sg", "숏게임 성공", "ox"]]],
+    ["메모", [["memo", "메모", "text"]]],
+  ];
+  const FLAT = FIELDS.flatMap(([, fs]) => fs);
+  const TEXT_KEYS = new Set(["miss", "gmiss", "memo"]);
+  const HINT = {
+    score: "파=0, 보기=1, 더블=2, 버디=-1", fw: "파4·파5만", miss: "L 왼쪽 / R 오른쪽 / H 훅 / S 슬라이스 / - 없음",
+    ong: "그린에 올라가기까지 친 타수(벌타 포함)", gir: "비우면 온그린 타수로 자동 판정", sg: "어프로치가 의도대로 됐으면 ○",
+    gmiss: "그린을 놓친 방향", appr: "그린을 놓쳤을 때 핀까지 남은 거리",
+  };
+
   function inputView(id) {
     const edit = id ? rounds.find((r) => r.id === id) : null;
-    const r = edit ? structuredClone(edit) : { date: new Date().toISOString().slice(0, 10), course: "", front: "", back: "", memo: "", holes: [] };
-    const hmap = Object.fromEntries((r.holes || []).map((h) => [h.h, h]));
+    if (id && !edit) { app.innerHTML = `<p>라운드를 찾을 수 없습니다. <a href="#/rounds">목록으로</a></p>`; return; }
+    const draftKey = KEY_DRAFT + (edit ? ":" + edit.id : ":new");
+    const draft = ls.get(draftKey);
+    const base = edit ? structuredClone(edit) : { date: new Date().toISOString().slice(0, 10), course: "", front: "", back: "", tee: "White", memo: "", holes: [] };
+    let r = draft && draft.holes ? draft : base;
+    const H = Object.fromEntries(Array.from({ length: 18 }, (_, i) => [i + 1, { h: i + 1 }]));
+    (r.holes || []).forEach((h) => (H[h.h] = { ...h }));
+    let cur = 1;
     const courses = [...new Set(rounds.map((x) => x.course))].sort();
-    const opt = (vals, cur, blank = "") => `<option value="">${blank}</option>` + vals.map((v) => `<option value="${v}" ${String(cur) === String(v) ? "selected" : ""}>${v > 0 && typeof v === "number" ? "+" + v : v}</option>`).join("");
-    const holeRow = (n) => {
-      const h = hmap[n] || {};
-      return `<tr data-h="${n}">
-        <td class="hn">${n}</td>
-        <td><select data-k="par">${opt([3, 4, 5, 6], h.par ?? "")}</select></td>
-        <td><select data-k="score" class="sc-cell">${opt([-3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8], h.score ?? "")}</select></td>
-        <td><select data-k="putts">${opt([0, 1, 2, 3, 4, 5], h.putts ?? "")}</select></td>
-        <td><select data-k="tee">${opt(["F", "L", "R"], h.tee ?? "", "-")}</select></td>
-        <td><select data-k="pen">${opt([0, 1, 2, 3, 4], h.pen ?? "")}</select></td>
-        <td class="det"><input data-k="fp" type="number" inputmode="decimal" step="0.5" min="0" value="${h.fp ?? ""}" style="width:64px"></td>
-      </tr>`;
-    };
+    const tees = [...new Set(["White", "Blue", "Black", "Red", "Gold", ...rounds.map((x) => x.tee).filter(Boolean)])];
+
     app.innerHTML = `
       <h2>${edit ? "라운드 수정" : "라운드 입력"}</h2>
-      <div class="notice">홀마다 <b>스코어(+/-) · 퍼트 · 티샷(F/L/R) · 벌타</b>만 적으면 GIR·스크램블·3퍼트가 자동 계산됩니다. 퍼트를 비우면 스코어 분석만 합니다.</div>
+      ${G.canWrite() ? "" : `<div class="notice">지금은 <b>읽기 전용</b>입니다. 저장하려면 <a href="#/settings">설정</a>에서 GitHub 토큰을 넣어 주세요. 입력 내용은 이 기기에 임시 저장됩니다.</div>`}
+      ${draft ? `<div class="notice" style="margin-top:8px">이전에 입력하던 내용을 불러왔습니다. <button class="link" id="bDiscard" type="button">버리고 새로 시작</button></div>` : ""}
       <div class="card" style="margin-top:12px">
         <div class="form">
           <label class="f">날짜<input id="fDate" type="date" value="${esc(r.date)}"></label>
           <label class="f">골프장<input id="fCourse" list="courseList" value="${esc(r.course)}" placeholder="예: 기흥CC"></label>
           <label class="f">전반 코스<input id="fFront" value="${esc(r.front)}" placeholder="예: NORTH"></label>
           <label class="f">후반 코스<input id="fBack" value="${esc(r.back)}" placeholder="예: WEST"></label>
+          <label class="f">티<input id="fTee" list="teeList" value="${esc(r.tee || "")}"></label>
+          <label class="f">날씨·컨디션·메모<input id="fMemo" value="${esc(r.memo)}"></label>
         </div>
         <datalist id="courseList">${courses.map((c) => `<option value="${esc(c)}">`).join("")}</datalist>
-        <div class="row" style="margin-top:10px">
-          <button class="btn ghost" id="bPar" type="button">이전 라운드 Par 불러오기</button>
-          <label class="row" style="gap:6px;font-size:14px"><input type="checkbox" id="fDet"> 1st 퍼트 거리 입력</label>
-        </div>
+        <datalist id="teeList">${tees.map((c) => `<option value="${esc(c)}">`).join("")}</datalist>
+        <div class="row" style="margin-top:10px"><button class="btn ghost" id="bCourse" type="button">이전 라운드 코스 정보 불러오기 (Par·거리·핸디캡)</button></div>
       </div>
-      <div class="tbl-wrap holes-in" style="margin-top:12px"><table>
-        <thead><tr><th>홀</th><th>Par</th><th>스코어</th><th>퍼트</th><th>티샷</th><th>벌타</th><th class="det">1st퍼트(m)</th></tr></thead>
-        <tbody>
-          ${Array.from({ length: 9 }, (_, i) => holeRow(i + 1)).join("")}
-          <tr class="sep"><td colspan="7" id="sumFront"></td></tr>
-          ${Array.from({ length: 9 }, (_, i) => holeRow(i + 10)).join("")}
-          <tr class="sep"><td colspan="7" id="sumBack"></td></tr>
-        </tbody>
-      </table></div>
+
+      <div class="holenav" id="holeNav"></div>
+      <div class="card holecard" id="holeCard"></div>
+      <div class="row" style="margin-top:10px;justify-content:space-between">
+        <button class="btn ghost" id="bPrev" type="button">◀ 이전 홀</button>
+        <button class="btn ghost" id="bNext" type="button">다음 홀 ▶</button>
+      </div>
+
+      <h3>스코어카드 미리보기</h3>
+      <div id="preview"></div>
       <div class="totals" id="totals"></div>
-      <label class="f" style="margin-top:12px">메모<textarea id="fMemo">${esc(r.memo)}</textarea></label>
       <div class="row" style="margin-top:14px">
-        <button class="btn" id="bSave" type="button">저장</button>
-        <a class="btn ghost" href="${edit ? "#/round/" + esc(edit.id) : "#/rounds"}">취소</a>
+        <button class="btn" id="bSave" type="button" ${G.canWrite() ? "" : "disabled"}>GitHub에 저장</button>
+        <a class="btn ghost" href="${edit ? "#/round/" + encodeURIComponent(edit.id) : "#/rounds"}">취소</a>
       </div>
-      <p class="legend-note">티샷: F 페어웨이 / L 왼쪽 미스 / R 오른쪽 미스 (파3은 비움). 퍼트는 그린 위에서 친 것만 셉니다.</p>
-    `;
-    const tbody = app.querySelector("tbody");
-    const detBox = document.getElementById("fDet");
-    const hasFp = (r.holes || []).some((h) => isNum(h.fp));
-    detBox.checked = hasFp;
-    const showDet = () => app.querySelectorAll(".det").forEach((el) => (el.style.display = detBox.checked ? "" : "none"));
-    detBox.addEventListener("change", showDet);
-    showDet();
-    const read = () => {
-      const hs = [];
-      tbody.querySelectorAll("tr[data-h]").forEach((tr) => {
-        const h = { h: Number(tr.dataset.h) };
-        tr.querySelectorAll("[data-k]").forEach((el) => {
-          const v = el.value;
-          if (v === "") return;
-          h[el.dataset.k] = el.dataset.k === "tee" ? v : Number(v);
+      <p class="legend-note">중간에 저장해도 됩니다. 나중에 「수정」으로 이어서 입력할 수 있습니다.</p>`;
+
+    const $ = (s) => document.getElementById(s);
+    const meta = () => ({ date: $("fDate").value, course: $("fCourse").value.trim(), front: $("fFront").value.trim(), back: $("fBack").value.trim(), tee: $("fTee").value.trim(), memo: $("fMemo").value.trim() });
+    const holesArr = () => Object.values(H).map((h) => Object.fromEntries(Object.entries(h).filter(([, v]) => v !== "" && v !== null && v !== undefined))).filter((h) => Object.keys(h).length > 1);
+    const saveDraft = () => ls.set(draftKey, { ...meta(), id: edit?.id, holes: holesArr() });
+
+    function field([k, lab, type, opts]) {
+      const v = H[cur][k];
+      const dis = k === "fw" && H[cur].par === 3 ? "disabled" : "";
+      let ctl;
+      if (type === "sel") ctl = `<select data-k="${k}" ${dis}><option value=""></option>${opts.map((o) => `<option value="${o}" ${String(v) === String(o) ? "selected" : ""}>${typeof o === "number" && o > 0 && k === "score" ? "+" + o : o}</option>`).join("")}</select>`;
+      else if (type === "ox") ctl = `<select data-k="${k}" ${dis}><option value=""></option><option value="1" ${v === 1 ? "selected" : ""}>○</option><option value="0" ${v === 0 ? "selected" : ""}>×</option></select>`;
+      else if (type === "num") ctl = `<input data-k="${k}" type="number" inputmode="decimal" step="0.5" min="0" value="${v ?? ""}">`;
+      else ctl = `<input data-k="${k}" value="${esc(v ?? "")}">`;
+      return `<label class="f ${k === "score" ? "key" : ""} ${k === "memo" ? "wide" : ""}">${lab}${ctl}${HINT[k] ? `<span class="hint">${HINT[k]}</span>` : ""}</label>`;
+    }
+    function drawCard() {
+      const h = H[cur];
+      const gir = S.holeGir(h);
+      $("holeCard").innerHTML = `
+        <div class="row" style="justify-content:space-between;align-items:baseline">
+          <div class="hc-title">${cur}번 홀 <span class="muted">${cur <= 9 ? "전반" : "후반"}</span></div>
+          <div class="muted">${isNum(h.par) && isNum(h.score) ? `타수 <b>${h.par + h.score}</b>` : ""} ${gir === null ? "" : `· GIR ${gir ? "○" : "×"}`} ${S.holeCheck(h) ? `<span class="ng"> · 온그린+퍼트 ≠ 타수</span>` : ""}</div>
+        </div>
+        ${FIELDS.map(([g, fs]) => `<div class="fgroup"><div class="fg-title">${g}</div><div class="form">${fs.map(field).join("")}</div></div>`).join("")}`;
+      $("holeCard").querySelectorAll("[data-k]").forEach((el) => {
+        el.addEventListener("change", () => {
+          const k = el.dataset.k;
+          const raw = el.value;
+          H[cur][k] = raw === "" ? undefined : TEXT_KEYS.has(k) ? raw.trim() : k === "dist" || k === "drive" ? Math.round(Number(raw)) : Number(raw);
+          if (k === "par" && H[cur].par === 3) H[cur].fw = undefined;
+          saveDraft();
+          drawAll(k === "par");
         });
-        if (h.par !== 3 || h.tee) {
-          /* 파3 티샷은 통계에서 빠지지만 입력값은 그대로 둔다 */
-        }
-        if (Object.keys(h).length > 1) hs.push(h);
       });
-      return hs;
-    };
-    const paint = () => {
-      tbody.querySelectorAll("select[data-k=score]").forEach((el) => {
-        el.className = "sc-cell";
-        const v = Number(el.value);
-        if (el.value === "") return;
-        el.classList.add(v <= -1 ? "sc-m2" : v === 0 ? "sc-0" : v === 2 ? "sc-2" : v >= 3 ? "sc-3" : "x");
-      });
-      const hs = read();
-      const half = (a, b) => {
-        const x = hs.filter((h) => h.h >= a && h.h <= b);
-        const par = S.sum(x.filter((h) => isNum(h.par)).map((h) => h.par));
-        const sc = x.filter((h) => isNum(h.score));
-        const putts = x.filter((h) => isNum(h.putts));
-        return { par, over: S.sum(sc.map((h) => h.score)), strokes: S.sum(sc.filter((h) => isNum(h.par)).map((h) => h.par + h.score)), n: sc.length, putts: S.sum(putts.map((h) => h.putts)) };
-      };
-      const fr = half(1, 9), bk = half(10, 18);
-      document.getElementById("sumFront").textContent = `전반  Par ${fr.par || "-"}  /  타수 ${fr.n ? fr.strokes : "-"} (${fr.n ? sgn(fr.over, 0) : "-"})  /  퍼트 ${fr.putts || "-"}`;
-      document.getElementById("sumBack").textContent = `후반  Par ${bk.par || "-"}  /  타수 ${bk.n ? bk.strokes : "-"} (${bk.n ? sgn(bk.over, 0) : "-"})  /  퍼트 ${bk.putts || "-"}`;
-      const st = S.round({ date: document.getElementById("fDate").value, holes: hs });
-      document.getElementById("totals").innerHTML = `
-        <span>입력 홀 <b>${st.holes}</b></span>
-        <span>총타수 <b>${st.full ? st.strokes : fr.strokes + bk.strokes || "-"}</b></span>
-        <span>오버 <b>${sgn(st.over, 0)}</b></span>
-        ${st.detail ? `<span>퍼트 <b>${st.putts}</b></span><span>GIR <b>${st.gir}</b></span><span>3퍼트 <b>${st.p3}</b></span>` : ""}
-        <span>더블+ <b>${st.dbl}</b></span>`;
-    };
-    tbody.addEventListener("change", paint);
-    tbody.addEventListener("input", paint);
-    paint();
-    document.getElementById("bPar").addEventListener("click", () => {
-      const c = document.getElementById("fCourse").value.trim();
-      const fr = document.getElementById("fFront").value.trim();
-      const bk = document.getElementById("fBack").value.trim();
-      const prev = S.byRecent(rounds.filter((x) => x.course === c && x.id !== r.id));
+    }
+    function drawNav() {
+      $("holeNav").innerHTML = Array.from({ length: 18 }, (_, i) => {
+        const h = H[i + 1];
+        const s = h.score;
+        const cls = isNum(s) ? (s <= -1 ? "sc-m2" : s === 0 ? "sc-0" : s === 1 ? "sc-1" : s === 2 ? "sc-2" : "sc-3") : "";
+        return `<button type="button" class="hn-btn ${cls} ${i + 1 === cur ? "cur" : ""}" data-h="${i + 1}"><span>${i + 1}</span><small>${isNum(s) ? (s > 0 ? "+" + s : s) : "·"}</small></button>`;
+      }).join("");
+      $("holeNav").querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { cur = Number(b.dataset.h); drawAll(true); }));
+    }
+    function drawPreview() {
+      $("preview").innerHTML = scorecard({ holes: holesArr() }, true);
+      const st = S.round({ date: meta().date, holes: holesArr() });
+      $("totals").innerHTML = `<span>입력 홀 <b>${st.holes}</b></span><span>총타수 <b>${st.strokes ?? "-"}</b></span><span>오버 <b>${sgn(st.over, 0)}</b></span>
+        ${st.detail ? `<span>퍼트 <b>${st.putts}</b></span><span>GIR <b>${st.gir}</b></span><span>3퍼트 <b>${st.p3}</b></span>` : ""}<span>더블+ <b>${st.dbl}</b></span>
+        ${st.checks.length ? `<span class="ng">기록 확인: ${st.checks.join(", ")}번 홀</span>` : ""}`;
+    }
+    function drawAll(card = true) { drawNav(); if (card) drawCard(); drawPreview(); }
+    drawAll();
+    ["fDate", "fCourse", "fFront", "fBack", "fTee", "fMemo"].forEach((x) => $(x).addEventListener("input", saveDraft));
+    $("bPrev").onclick = () => { cur = cur === 1 ? 18 : cur - 1; drawAll(); };
+    $("bNext").onclick = () => { cur = cur === 18 ? 1 : cur + 1; drawAll(); };
+    if ($("bDiscard")) $("bDiscard").onclick = () => { ls.del(draftKey); inputView(id); };
+    $("bCourse").onclick = () => {
+      const m = meta();
+      const prev = S.byRecent(rounds.filter((x) => x.course === m.course && x.id !== edit?.id));
       if (!prev.length) return toast("같은 골프장 이전 기록이 없습니다.");
-      // 같은 코스명이 전반이든 후반이든 있었으면 그 9홀 Par를 쓴다
-      const nine = (name) => {
+      // 코스명이 전반·후반 어느 쪽에 있었든 그 9홀 정보를 쓴다
+      const nine = (name, fallbackFront) => {
         for (const p of prev) {
-          if (p.front === name) return p.holes.filter((h) => h.h <= 9).map((h) => h.par);
-          if (p.back === name) return p.holes.filter((h) => h.h > 9).map((h) => h.par);
+          if (name && p.front === name) return p.holes.filter((h) => h.h <= 9);
+          if (name && p.back === name) return p.holes.filter((h) => h.h > 9);
         }
-        return null;
+        return prev[0].holes.filter((h) => (fallbackFront ? h.h <= 9 : h.h > 9));
       };
-      const fp = (fr && nine(fr)) || prev[0].holes.filter((h) => h.h <= 9).map((h) => h.par);
-      const bp = (bk && nine(bk)) || prev[0].holes.filter((h) => h.h > 9).map((h) => h.par);
-      [...fp, ...bp].forEach((p, i) => {
-        const el = tbody.querySelector(`tr[data-h="${i + 1}"] select[data-k=par]`);
-        if (el && isNum(p)) el.value = String(p);
+      const fill = (src, start) => src.sort((a, b) => a.h - b.h).forEach((h, i) => {
+        const t = H[start + i];
+        if (!t) return;
+        for (const k of ["par", "dist", "hcp"]) if (isNum(h[k]) && !isNum(t[k])) t[k] = h[k];
       });
-      paint();
-      toast(`${dot(prev[0].date)} 기록에서 Par를 불러왔습니다.`);
-    });
-    document.getElementById("bSave").addEventListener("click", () => {
-      const date = document.getElementById("fDate").value;
-      const course = document.getElementById("fCourse").value.trim();
-      const hs = read();
-      if (!date || !course) return toast("날짜와 골프장을 입력하세요.");
+      fill(nine(m.front, true), 1);
+      fill(nine(m.back, false), 10);
+      saveDraft();
+      drawAll();
+      toast(`${dot(prev[0].date)} 등 이전 기록에서 코스 정보를 불러왔습니다.`);
+    };
+    $("bSave").onclick = async () => {
+      const m = meta();
+      const hs = holesArr();
+      if (!m.date || !m.course) return toast("날짜와 골프장을 입력하세요.");
       if (!hs.some((h) => isNum(h.score))) return toast("스코어를 한 홀 이상 입력하세요.");
-      const obj = {
-        id: edit ? edit.id : "r" + date.replaceAll("-", "") + "-" + Date.now().toString(36),
-        date, course,
-        front: document.getElementById("fFront").value.trim(),
-        back: document.getElementById("fBack").value.trim(),
-        memo: document.getElementById("fMemo").value.trim(),
-        holes: hs,
-      };
-      if (edit) rounds[rounds.indexOf(edit)] = obj;
-      else rounds.push(obj);
-      saveRounds();
-      toast("저장했습니다.");
-      location.hash = "#/round/" + obj.id;
-    });
+      const obj = { id: edit ? edit.id : "r" + m.date.replaceAll("-", "") + "-" + Date.now().toString(36), ...m, holes: hs };
+      $("bSave").disabled = true;
+      $("bSave").textContent = "저장 중…";
+      try {
+        await commit((data) => {
+          const i = data.findIndex((x) => x.id === obj.id);
+          if (i >= 0) data[i] = obj; else data.push(obj);
+          return data.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+        }, `${edit ? "라운드 수정" : "라운드 추가"}: ${m.date} ${m.course}`);
+        ls.del(draftKey);
+        toast("GitHub에 저장했습니다.");
+        location.hash = "#/round/" + encodeURIComponent(obj.id);
+      } catch (e) {
+        toast(e.message, 6000);
+        $("bSave").disabled = false;
+        $("bSave").textContent = "GitHub에 저장";
+      }
+    };
+  }
+
+  // v2 「스코어카드」와 같은 행 구성
+  const CARD_ROWS = [["dist", "거리 (m)", "sum"], ["hcp", "핸디캡"], ["par", "Par", "sum"], ["score", "Score (+/-)", "sum"], ["fw", "FW 안착", "fw"], ["miss", "티샷 미스"], ["drive", "티샷 거리"], ["ong", "온그린 타수"], ["gir", "GIR"], ["putts", "Putts", "sum"], ["fp", "1st 퍼트 (m)"], ["gmiss", "그린 미스"], ["appr", "어프로치 (m)"], ["bunker", "벙커샷", "sum"], ["sg", "숏게임"], ["pen", "벌타", "sum"], ["memo", "메모"]];
+  function scorecard(r, compact) {
+    const hm = Object.fromEntries((r.holes || []).map((h) => [h.h, h]));
+    const used = new Set(r.holes.flatMap((h) => Object.keys(h)));
+    used.add("par"); used.add("score"); used.add("gir");
+    const rowsUsed = compact ? CARD_ROWS.filter(([k]) => used.has(k)) : CARD_ROWS;
+    const cell = (h, k) => {
+      const x = hm[h] || {};
+      const v = x[k];
+      if (k === "score" && isNum(v)) return `<td class="sc-cell ${v <= -1 ? "sc-m2" : v === 0 ? "sc-0" : v === 1 ? "sc-1" : v === 2 ? "sc-2" : "sc-3"}">${v > 0 ? "+" + v : v}</td>`;
+      if (k === "gir") { const g = hm[h] ? S.holeGir(x) : null; return `<td>${g === null ? "" : g ? "○" : "×"}</td>`; }
+      if (k === "fw" || k === "sg") return `<td>${v === 1 ? "○" : v === 0 ? "×" : ""}</td>`;
+      if (k === "memo") return `<td class="memo">${esc(v ?? "")}</td>`;
+      return `<td>${esc(v ?? "")}</td>`;
+    };
+    const tot = (a, k, how) => {
+      const xs = Array.from({ length: 9 }, (_, i) => hm[a + i]?.[k]);
+      if (how === "sum") { const n = xs.filter(isNum); return n.length ? S.sum(n) : ""; }
+      if (how === "fw") { const n = xs.filter(isNum); return n.length ? `${n.filter((v) => v === 1).length}/${n.length}` : ""; }
+      if (k === "gir") { const g = Array.from({ length: 9 }, (_, i) => (hm[a + i] ? S.holeGir(hm[a + i]) : null)).filter((v) => v !== null); return g.length ? `${S.sum(g)}/${g.length}` : ""; }
+      return "";
+    };
+    const half = (a, name) => `<div class="tbl-wrap card-tbl" style="margin-top:8px"><table>
+      <thead><tr><th class="l">${name}</th>${Array.from({ length: 9 }, (_, i) => `<th>${a + i}</th>`).join("")}<th>${a === 1 ? "OUT" : "IN"}</th></tr></thead>
+      <tbody>${rowsUsed.map(([k, lab, how]) => `<tr><th class="l">${lab}</th>${Array.from({ length: 9 }, (_, i) => cell(a + i, k)).join("")}<td><b>${tot(a, k, how || (k === "gir" ? "gir" : ""))}</b></td></tr>`).join("")}</tbody></table></div>`;
+    return half(1, "전반") + half(10, "후반");
   }
 
   // ───────────── 라운드 목록·상세 ─────────────
@@ -368,65 +418,61 @@
     app.innerHTML = `
       <div class="row" style="justify-content:space-between"><h2>라운드 목록 <span class="muted">${list.length}회</span></h2><a class="btn" href="#/input">+ 새 라운드</a></div>
       <div class="tbl-wrap"><table>
-        <thead><tr><th>날짜</th><th class="l">골프장</th><th>홀</th><th>총타수</th><th>오버</th><th>전반</th><th>후반</th><th>퍼트</th><th>GIR</th><th>더블+</th><th>벌타</th></tr></thead>
+        <thead><tr><th>날짜</th><th class="l">골프장</th><th>홀</th><th>총타수</th><th>오버</th><th>전반</th><th>후반</th><th>퍼트</th><th>GIR</th><th>FW</th><th>더블+</th><th>벌타</th></tr></thead>
         <tbody>${list.map((r) => {
           const s = S.round(r);
-          return `<tr class="click" data-id="${esc(r.id)}"><td>${dot(r.date)}</td><td class="l">${esc(r.course)}</td><td>${s.holes}</td><td><b>${s.strokes ?? "-"}</b></td><td>${sgn(s.over, 0)}</td><td>${s.front ?? "-"}</td><td>${s.back ?? "-"}</td><td>${s.detail ? s.putts : "-"}</td><td>${s.detail ? pct(s.girp) : "-"}</td><td>${s.dbl}</td><td>${s.detail && isNum(s.pen) ? s.pen : "-"}</td></tr>`;
+          return `<tr class="click" data-id="${esc(r.id)}"><td>${dot(r.date)}</td><td class="l">${esc(r.course)}</td><td>${s.holes}</td><td><b>${s.strokes ?? "-"}</b></td><td>${sgn(s.over, 0)}</td><td>${s.front ?? "-"}</td><td>${s.back ?? "-"}</td><td>${s.detail ? s.putts : "-"}</td><td>${s.detail ? pct(s.girp) : "-"}</td><td>${pct(s.fwp)}</td><td>${s.dbl}</td><td>${s.detail && isNum(s.pen) ? s.pen : "-"}</td></tr>`;
         }).join("")}</tbody>
       </table></div>`;
-    app.querySelectorAll("tr[data-id]").forEach((tr) => tr.addEventListener("click", () => (location.hash = "#/round/" + tr.dataset.id)));
+    app.querySelectorAll("tr[data-id]").forEach((tr) => tr.addEventListener("click", () => (location.hash = "#/round/" + encodeURIComponent(tr.dataset.id))));
   }
   function roundView(id) {
     const r = rounds.find((x) => x.id === id);
     if (!r) { app.innerHTML = `<p>라운드를 찾을 수 없습니다. <a href="#/rounds">목록으로</a></p>`; return; }
     const s = S.round(r);
-    const hm = Object.fromEntries(r.holes.map((h) => [h.h, h]));
-    const cell = (h, k) => {
-      const v = hm[h]?.[k];
-      if (k === "score" && isNum(v)) return `<td class="sc-cell ${v <= -1 ? "sc-m2" : v === 0 ? "sc-0" : v === 2 ? "sc-2" : v >= 3 ? "sc-3" : ""}">${v > 0 ? "+" + v : v}</td>`;
-      if (k === "gir") { const g = hm[h] ? S.holeGir(hm[h]) : null; return `<td>${g === null ? "" : g ? "●" : "○"}</td>`; }
-      return `<td>${v ?? ""}</td>`;
-    };
-    const half = (a) => {
-      const hs = Array.from({ length: 9 }, (_, i) => a + i);
-      const line = (lab, k) => `<tr><th class="l">${lab}</th>${hs.map((h) => cell(h, k)).join("")}</tr>`;
-      return `<div class="tbl-wrap" style="margin-top:10px"><table>
-        <thead><tr><th class="l">홀</th>${hs.map((h) => `<th>${h}</th>`).join("")}</tr></thead>
-        <tbody>${line("Par", "par")}${line("스코어", "score")}${line("퍼트", "putts")}${line("GIR", "gir")}${line("티샷", "tee")}${line("벌타", "pen")}</tbody></table></div>`;
-    };
+    const rad = S.analyze([r], settings).radar.score;
     app.innerHTML = `
       <div class="row" style="justify-content:space-between">
-        <h2>${dot(r.date)} ${esc(r.course)} <span class="muted">${esc([r.front, r.back].filter(Boolean).join(" / "))}</span></h2>
-        <div class="row"><a class="btn ghost" href="#/edit/${esc(r.id)}">수정</a><button class="btn danger" id="bDel" type="button">삭제</button></div>
+        <h2>${dot(r.date)} ${esc(r.course)} <span class="muted">${esc([r.front, r.back].filter(Boolean).join(" / "))}${r.tee ? " · " + esc(r.tee) : ""}</span></h2>
+        <div class="row"><a class="btn ghost" href="#/edit/${encodeURIComponent(r.id)}">수정</a><button class="btn danger" id="bDel" type="button" ${G.canWrite() ? "" : "disabled"}>삭제</button></div>
       </div>
       <div class="kpis">
         ${kpi("총타수", s.strokes ?? "-", s.full ? `전반 ${s.front} / 후반 ${s.back}` : `${s.holes}홀 입력`)}
         ${kpi("오버파", sgn(s.over, 0), `버디+ ${s.birdie} / 파 ${s.parn} / 보기 ${s.bogey}`)}
         ${kpi("더블+", s.dbl, `초과타 ${s.blow}`)}
-        ${s.detail ? kpi("퍼트", s.putts, `3퍼트 ${s.p3}`) + kpi("GIR", pct(s.girp), `스크램블 ${pct(s.scrp)}`) + kpi("FW", pct(s.fwp), `벌타 ${s.pen ?? "-"}`) : ""}
+        ${s.detail ? kpi("퍼트", s.putts, `3퍼트 ${s.p3} / 1퍼트 ${s.onep}`) + kpi("GIR", pct(s.girp), `스크램블 ${pct(s.scrp)}`) + kpi("FW", pct(s.fwp), `벌타 ${s.pen ?? "-"}`) : ""}
       </div>
-      ${half(1)}${half(10)}
+      ${s.checks.length ? `<div class="notice" style="margin-top:10px">기록 확인: ${s.checks.join(", ")}번 홀은 온그린 타수 + 퍼트가 타수와 다릅니다.</div>` : ""}
+      ${scorecard(r, false)}
       ${r.memo ? `<p class="card" style="margin-top:12px">${esc(r.memo)}</p>` : ""}
-      <p class="legend-note">GIR ● 적중 / ○ 실패 (타수 − 퍼트 ≤ Par − 2, 직접 입력값이 있으면 그 값)</p>
+      ${s.detail ? `<div class="card" style="margin-top:12px"><h3 class="mt0">이 라운드 6영역</h3><div class="chart-box"><canvas id="cR"></canvas></div></div>` : ""}
       <div id="delBox"></div>
       <p><a href="#/rounds">← 목록으로</a></p>`;
-    document.getElementById("bDel").addEventListener("click", () => {
-      document.getElementById("delBox").innerHTML = `<div class="notice">이 라운드를 삭제할까요? <button class="btn danger" id="bDel2" type="button">삭제 확인</button></div>`;
-      document.getElementById("bDel2").addEventListener("click", () => {
-        rounds = rounds.filter((x) => x.id !== id);
-        saveRounds();
-        toast("삭제했습니다.");
-        location.hash = "#/rounds";
+    if (s.detail) {
+      const rk = Object.keys(settings.radar);
+      chart("cR", {
+        type: "radar",
+        data: { labels: rk.map((k) => settings.radar[k].label), datasets: [{ data: rk.map((k) => rad[k]), backgroundColor: "rgba(30,94,59,.25)", borderColor: "#1e5e3b" }, { data: rk.map(() => settings.radarTarget), borderColor: "#f28c28", borderDash: [6, 4], backgroundColor: "transparent", pointRadius: 0 }] },
+        options: baseOpts({ scales: { r: { min: 0, max: 100, ticks: { display: false } } } }),
       });
-    });
+    }
+    document.getElementById("bDel").onclick = () => {
+      document.getElementById("delBox").innerHTML = `<div class="notice">이 라운드를 GitHub에서 삭제할까요? <button class="btn danger" id="bDel2" type="button">삭제 확인</button></div>`;
+      document.getElementById("bDel2").onclick = async () => {
+        try {
+          await commit((data) => data.filter((x) => x.id !== id), `라운드 삭제: ${r.date} ${r.course}`);
+          toast("삭제했습니다.");
+          location.hash = "#/rounds";
+        } catch (e) { toast(e.message, 6000); }
+      };
+    };
   }
 
   // ───────────── 통계 ─────────────
   function statsView() {
     const A = S.analyze(rounds, settings);
     const bands = [["70대", 0, 79], ["80대", 80, 89], ["90대", 90, 99], ["100 이상", 100, 999]].map(([l, a, b]) => ({ l, n: A.fulls.filter((r) => r.strokes >= a && r.strokes <= b).length }));
-    const years = [...new Set(A.rs.map((r) => r.year))].sort();
-    const yr = years.map((y) => {
+    const yr = [...new Set(A.rs.map((r) => r.year))].sort().map((y) => {
       const rs = A.rs.filter((r) => r.year === y), fs = rs.filter((r) => r.full);
       return { y, n: rs.length, f: fs.length, c: new Set(rs.map((r) => r.course)).size, avg: S.avg(fs.map((r) => r.strokes)), best: fs.length ? Math.min(...fs.map((r) => r.strokes)) : null, worst: fs.length ? Math.max(...fs.map((r) => r.strokes)) : null };
     });
@@ -445,125 +491,143 @@
       <div class="tbl-wrap"><table><thead><tr><th>연도</th><th>라운드</th><th>18홀</th><th>골프장 수</th><th>평균 타수</th><th>베스트</th><th>워스트</th></tr></thead>
         <tbody>${yr.map((r) => `<tr><td><b>${r.y}</b></td><td>${r.n}</td><td>${r.f}</td><td>${r.c}</td><td>${f1(r.avg)}</td><td>${r.best ?? "-"}</td><td>${r.worst ?? "-"}</td></tr>`).join("")}</tbody></table></div>
       <div class="grid g2" style="margin-top:12px">
-        <div class="card"><h3 style="margin-top:0">연도별 라운드 · 골프장 수</h3><div class="chart-box"><canvas id="cYear"></canvas></div></div>
-        <div class="card"><h3 style="margin-top:0">연도별 평균 타수</h3><div class="chart-box"><canvas id="cYearAvg"></canvas></div></div>
+        <div class="card"><h3 class="mt0">연도별 라운드 · 골프장 수</h3><div class="chart-box"><canvas id="cYear"></canvas></div></div>
+        <div class="card"><h3 class="mt0">연도별 평균 타수</h3><div class="chart-box"><canvas id="cYearAvg"></canvas></div></div>
       </div>
       <h2>골프장별 <span class="muted">${cs.length}곳</span></h2>
       <div class="tbl-wrap"><table><thead><tr><th class="l">골프장</th><th>방문</th><th>18홀 평균</th><th>베스트</th><th>최근 방문</th></tr></thead>
-        <tbody>${cs.map((r) => `<tr><td class="l">${esc(r.c)}</td><td>${r.n}</td><td>${f1(r.avg)}</td><td class="${A.best && r.best === A.best.strokes ? "ng" : ""}">${r.best ?? "-"}</td><td>${dot(r.last)}</td></tr>`).join("")}</tbody></table></div>
-    `;
-    chart("cBand", { type: "bar", data: { labels: bands.map((b) => b.l), datasets: [{ data: bands.map((b) => b.n), backgroundColor: "#2e7d5b" }] }, options: baseOpts({ scales: { y: { beginAtZero: true, grid: { display: false } }, x: { grid: { display: false } } } }), plugins: [valueLabels((v) => v)] });
-    chart("cYear", {
-      type: "bar",
-      data: { labels: yr.map((r) => r.y), datasets: [{ label: "라운드", data: yr.map((r) => r.n), backgroundColor: "#1f6fd6" }, { label: "골프장", data: yr.map((r) => r.c), backgroundColor: "#f28c28" }] },
-      options: baseOpts({ plugins: { legend: { display: true, position: "bottom" } }, scales: { y: { beginAtZero: true, grid: { display: false } }, x: { grid: { display: false } } } }),
-      plugins: [valueLabels((v) => v)],
-    });
-    chart("cYearAvg", { type: "bar", data: { labels: yr.map((r) => r.y), datasets: [{ data: yr.map((r) => r.avg), backgroundColor: "#1e5e3b" }] }, options: baseOpts({ scales: { y: { suggestedMin: 70, grid: { display: false } }, x: { grid: { display: false } } } }), plugins: [valueLabels(f1)] });
+        <tbody>${cs.map((r) => `<tr><td class="l">${esc(r.c)}</td><td>${r.n}</td><td>${f1(r.avg)}</td><td class="${A.best && r.best === A.best.strokes ? "ng" : ""}">${r.best ?? "-"}</td><td>${dot(r.last)}</td></tr>`).join("")}</tbody></table></div>`;
+    const bar = (id, labels, data, color, fmt, min) => chart(id, { type: "bar", data: { labels, datasets: [{ data, backgroundColor: color }] }, options: baseOpts({ scales: { y: { beginAtZero: min === undefined, suggestedMin: min, ...noGrid }, x: noGrid } }), plugins: [valueLabels(fmt)] });
+    bar("cBand", bands.map((b) => b.l), bands.map((b) => b.n), "#2e7d5b", (v) => v);
+    chart("cYear", { type: "bar", data: { labels: yr.map((r) => r.y), datasets: [{ label: "라운드", data: yr.map((r) => r.n), backgroundColor: "#1f6fd6" }, { label: "골프장", data: yr.map((r) => r.c), backgroundColor: "#f28c28" }] }, options: baseOpts({ plugins: legendOn, scales: { y: { beginAtZero: true, ...noGrid }, x: noGrid } }), plugins: [valueLabels((v) => v)] });
+    bar("cYearAvg", yr.map((r) => r.y), yr.map((r) => r.avg), "#1e5e3b", f1, 70);
   }
 
   // ───────────── 홀·파 분석 ─────────────
   function holesView() {
     const H = S.holeLevel(rounds);
-    const maxO = Math.max(...H.byHole.map((h) => h.over ?? -9)), minO = Math.min(...H.byHole.map((h) => h.over ?? 99));
+    const os = H.byHole.map((h) => h.over).filter(isNum);
+    const maxO = Math.max(...os), minO = Math.min(...os);
+    const prow = (lab, x) => `<tr><td class="l"><b>${lab}</b></td><td>${x.n}</td><td>${f2(x.strokes)}</td><td><b>${sgn(x.over)}</b></td><td>${pct(x.birdie)}</td><td>${pct(x.parExact)}</td><td>${pct(x.bogey)}</td><td>${pct(x.double)}</td><td>${pct(x.triple)}</td></tr>`;
     app.innerHTML = `
       <h2>파 유형별 <span class="muted">Par가 기록된 ${H.total.n}홀</span></h2>
       <div class="tbl-wrap"><table><thead><tr><th class="l">파 유형</th><th>홀 수</th><th>평균 타수</th><th>평균 오버</th><th>버디+</th><th>파</th><th>보기</th><th>더블</th><th>트리플+</th></tr></thead>
-        <tbody>${[3, 4, 5].map((p) => { const x = H.byPar[p]; return `<tr><td class="l"><b>파${p}</b></td><td>${x.n}</td><td>${f2(x.strokes)}</td><td><b>${sgn(x.over)}</b></td><td>${pct(x.birdie)}</td><td>${pct(x.parExact)}</td><td>${pct(x.bogey)}</td><td>${pct(x.double)}</td><td>${pct(x.triple)}</td></tr>`; }).join("")}
-        <tr><td class="l"><b>전체</b></td><td>${H.total.n}</td><td>${f2(H.total.strokes)}</td><td><b>${sgn(H.total.over)}</b></td><td>${pct(H.total.birdie)}</td><td>${pct(H.total.parExact)}</td><td>${pct(H.total.bogey)}</td><td>${pct(H.total.double)}</td><td>${pct(H.total.triple)}</td></tr></tbody></table></div>
+        <tbody>${[3, 4, 5].map((p) => prow("파" + p, H.byPar[p])).join("")}${prow("전체", H.total)}</tbody></table></div>
       <div class="grid g2" style="margin-top:12px">
-        <div class="card"><h3 style="margin-top:0">파 유형별 평균 오버</h3><div class="chart-box"><canvas id="cPar"></canvas></div></div>
-        <div class="card"><h3 style="margin-top:0">연도별 파 유형 평균 오버</h3><div class="chart-box"><canvas id="cYearPar"></canvas></div></div>
+        <div class="card"><h3 class="mt0">파 유형별 평균 오버</h3><div class="chart-box"><canvas id="cPar"></canvas></div></div>
+        <div class="card"><h3 class="mt0">연도별 파 유형 평균 오버</h3><div class="chart-box"><canvas id="cYearPar"></canvas></div></div>
       </div>
       <h2>홀 번호별</h2>
       <div class="card"><div class="chart-box"><canvas id="cHole"></canvas></div>
         <p class="legend-note">골프장마다 홀 구성이 달라 홀 난이도 비교가 아니라, 첫 홀(워밍업)·막판(체력·집중력) 같은 흐름 패턴을 보는 용도입니다. 빨강=가장 약함, 파랑=가장 좋음.</p></div>
       <div class="tbl-wrap" style="margin-top:12px"><table><thead><tr><th>홀</th><th>기록 수</th><th>평균 Par</th><th>평균 타수</th><th>평균 오버</th><th>파 이하</th><th>더블+</th></tr></thead>
-        <tbody>${H.byHole.map((x, i) => `<tr><td><b>${i + 1}</b></td><td>${x.n}</td><td>${f1(x.par)}</td><td>${f2(x.strokes)}</td><td class="${x.over === maxO ? "ng" : x.over === minO ? "ok" : ""}"><b>${sgn(x.over)}</b></td><td>${pct(x.parlow)}</td><td>${pct(x.dbl)}</td></tr>`).join("")}</tbody></table></div>
-    `;
-    chart("cPar", { type: "bar", data: { labels: ["파3", "파4", "파5"], datasets: [{ data: [3, 4, 5].map((p) => H.byPar[p].over), backgroundColor: "#f28c28" }] }, options: baseOpts({ scales: { y: { beginAtZero: true, grid: { display: false } }, x: { grid: { display: false } } } }), plugins: [valueLabels(f2)] });
-    chart("cYearPar", {
-      type: "line",
-      data: { labels: H.byYearPar.map((y) => y.year), datasets: [["p3", "파3", "#1f6fd6"], ["p4", "파4", "#2e7d5b"], ["p5", "파5", "#f28c28"]].map(([k, l, c]) => ({ label: l, data: H.byYearPar.map((y) => y[k]), borderColor: c, backgroundColor: c, pointRadius: 4, tension: 0 })) },
-      options: baseOpts({ plugins: { legend: { display: true, position: "bottom" } }, scales: { y: { grid: { display: false } }, x: { grid: { display: false } } } }),
-      plugins: [valueLabels(f2)],
-    });
-    chart("cHole", {
-      type: "bar",
-      data: { labels: H.byHole.map((_, i) => i + 1), datasets: [{ data: H.byHole.map((h) => h.over), backgroundColor: H.byHole.map((h) => (h.over === maxO ? "#e5352b" : h.over === minO ? "#1f6fd6" : "#2e7d5b")) }] },
-      options: baseOpts({ scales: { y: { beginAtZero: true, grid: { display: false } }, x: { grid: { display: false } } } }),
-      plugins: [valueLabels(f1)],
-    });
+        <tbody>${H.byHole.map((x, i) => `<tr><td><b>${i + 1}</b></td><td>${x.n}</td><td>${f1(x.par)}</td><td>${f2(x.strokes)}</td><td class="${x.over === maxO ? "ng" : x.over === minO ? "ok" : ""}"><b>${sgn(x.over)}</b></td><td>${pct(x.parlow)}</td><td>${pct(x.dbl)}</td></tr>`).join("")}</tbody></table></div>`;
+    chart("cPar", { type: "bar", data: { labels: ["파3", "파4", "파5"], datasets: [{ data: [3, 4, 5].map((p) => H.byPar[p].over), backgroundColor: "#f28c28" }] }, options: baseOpts({ scales: { y: { beginAtZero: true, ...noGrid }, x: noGrid } }), plugins: [valueLabels(f2)] });
+    chart("cYearPar", { type: "line", data: { labels: H.byYearPar.map((y) => y.year), datasets: [["p3", "파3", "#1f6fd6"], ["p4", "파4", "#2e7d5b"], ["p5", "파5", "#f28c28"]].map(([k, l, c]) => ({ label: l, data: H.byYearPar.map((y) => y[k]), borderColor: c, backgroundColor: c, pointRadius: 4, tension: 0 })) }, options: baseOpts({ plugins: legendOn, scales: { y: noGrid, x: noGrid } }), plugins: [valueLabels(f2)] });
+    chart("cHole", { type: "bar", data: { labels: H.byHole.map((_, i) => i + 1), datasets: [{ data: H.byHole.map((h) => h.over), backgroundColor: H.byHole.map((h) => (h.over === maxO ? "#e5352b" : h.over === minO ? "#1f6fd6" : "#2e7d5b")) }] }, options: baseOpts({ scales: { y: { beginAtZero: true, ...noGrid }, x: noGrid } }), plugins: [valueLabels(f1)] });
+  }
+
+  // ───────────── 상세 분석 (v2 「상세분석」 시트) ─────────────
+  function detailView() {
+    const list = S.byRecent(rounds);
+    const sel = new URLSearchParams(location.hash.split("?")[1] || "").get("r") || "";
+    const D = S.detailBlocks(rounds, sel || null);
+    const t = (title, heads, rows, note) => `<h3>${title}</h3><div class="tbl-wrap"><table><thead><tr>${heads.map((h, i) => `<th class="${i ? "" : "l"}">${h}</th>`).join("")}</tr></thead>
+      <tbody>${rows.map((r) => `<tr>${r.map((c, i) => `<td class="${i ? "" : "l"}">${c}</td>`).join("")}</tr>`).join("")}</tbody></table></div>${note ? `<p class="legend-note">${note}</p>` : ""}`;
+    app.innerHTML = `
+      <h2>상세 분석 <span class="muted">무엇이 스코어를 바꾸나</span></h2>
+      <div class="card"><label class="f">분석 범위<select id="scope"><option value="">전체 (${rounds.length}라운드)</option>${list.map((r) => `<option value="${esc(r.id)}" ${r.id === sel ? "selected" : ""}>${dot(r.date)} ${esc(r.course)}</option>`).join("")}</select></label>
+        <p class="legend-note">${D.n}홀 분석. 상세 항목(FW·퍼트·1st 퍼트·미스 방향 등)을 기록한 홀만 각 표에 집계됩니다.</p></div>
+      ${t("① 티샷 FW (파4·파5)", ["", "홀 수", "평균 Score", "더블+ 비율"], [["FW 안착", D.fw.in.n, sgn(D.fw.in.over), pct(D.fw.in.dbl)], ["FW 미스", D.fw.out.n, sgn(D.fw.out.over), pct(D.fw.out.dbl)], ["<b class='ng'>FW 미스 시 추가 타수</b>", "", `<b class="ng">${sgn(D.fw.diff)}</b>`, ""]], "FW 미스 홀의 평균 Score가 안착 홀보다 얼마나 높은지가 '티샷 정확도의 값'입니다. 차이가 크면 비거리보다 방향을 우선 연습합니다.")}
+      ${t("② 그린 적중 (GIR)", ["", "홀 수", "평균 Score", "평균 퍼트"], [["GIR 성공", D.gir.hit.n, sgn(D.gir.hit.over), f2(D.gir.hit.putts)], ["GIR 실패", D.gir.miss.n, sgn(D.gir.miss.over), f2(D.gir.miss.putts)]], "GIR 실패 홀의 평균 Score가 +1.5 이상이면 그린 주변(어프로치·벙커)에서 타수가 크게 새고 있다는 뜻입니다.")}
+      ${t("③ 첫 퍼트 거리대별", ["", "홀 수", "평균 퍼트", "1퍼트율", "3퍼트율"], D.fp.map((x) => [x.l, x.n, f2(x.putts), pct(x.one), pct(x.three)]), "3퍼트율이 높은 거리대가 거리감 연습 1순위입니다.")}
+      <div class="card" style="margin-top:8px"><div class="chart-box"><canvas id="cFp"></canvas></div></div>
+      ${t("④ 파 유형별", ["", "홀 수", "평균 Score", "파 이하율", "더블+ 비율"], D.par.map((x) => ["파" + x.p, x.n, sgn(x.over), pct(x.parlow), pct(x.dbl)]), "파5 더블+가 많으면 '3온 전략(안전한 레이업)'을 검토합니다.")}
+      ${t("⑤ 티샷 미스 방향", ["", "횟수", "비율", "평균 Score", "평균 벌타"], D.miss.map((x) => [x.l, x.n, pct(x.share), sgn(x.over), f2(x.pen)]), "한쪽으로 쏠림이 크면(예: R 60% 이상) 셋업·그립 점검 신호입니다.")}
+      ${t("⑥ 홀 난이도 · 전후반", ["", "홀 수", "평균 Score"], D.hcp.map((x) => [x.l, x.n, sgn(x.over)]), "쉬운 홀(핸디캡 13~18)에서도 평균 +1 이상이면 실수 관리 문제입니다. 핸디캡은 기록한 라운드만 집계됩니다.")}
+      ${t("⑦ 그린 미스 · 어프로치 거리", ["", "홀 수", "평균 Score", "스크램블%"], D.green.map((x) => [x.l, x.n, sgn(x.over), x.scr === null ? "-" : pct(x.scr)]), "짧음이 대부분이면 한 클럽 길게, 30m 이상에서 스크램블이 낮으면 하프 웨지 거리 연습을 우선합니다.")}`;
+    document.getElementById("scope").onchange = (e) => { location.hash = "#/detail" + (e.target.value ? "?r=" + encodeURIComponent(e.target.value) : ""); };
+    chart("cFp", { type: "bar", data: { labels: D.fp.map((x) => x.l), datasets: [{ label: "1퍼트율", data: D.fp.map((x) => x.one), backgroundColor: "#2e7d5b" }, { label: "3퍼트율", data: D.fp.map((x) => x.three), backgroundColor: "#e5352b" }] }, options: baseOpts({ plugins: legendOn, scales: { y: { beginAtZero: true, ticks: { callback: (v) => Math.round(v * 100) + "%" }, ...noGrid }, x: noGrid } }), plugins: [valueLabels(pct)] });
   }
 
   // ───────────── 설정·데이터 ─────────────
   function settingsView() {
+    const c = G.cfg();
     const tg = settings.targets, rd = settings.radar;
     app.innerHTML = `
+      <h2>GitHub 연결</h2>
+      <div class="card">
+        <p class="muted mt0">데이터 저장 위치: <b>${esc(c.owner)}/${esc(c.repo)}</b> · ${esc(c.branch)} · ${esc(c.path)}</p>
+        <label class="f">GitHub 토큰 (저장하는 기기에서만 입력)<input id="tok" type="password" autocomplete="off" placeholder="${c.token ? "저장됨 (바꾸려면 새로 입력)" : "github_pat_..."}"></label>
+        <div class="row" style="margin-top:10px">
+          <button class="btn" id="bTok" type="button">토큰 저장</button>
+          <button class="btn ghost" id="bTest" type="button" ${c.token ? "" : "disabled"}>연결 확인</button>
+          <button class="btn danger" id="bTokDel" type="button" ${c.token ? "" : "disabled"}>토큰 삭제</button>
+        </div>
+        <div class="notice" style="margin-top:12px">
+          <b>토큰 만드는 법</b> (한 번만): GitHub → Settings → Developer settings → Personal access tokens → <b>Fine-grained tokens</b> → Generate new token<br>
+          · Repository access: <b>Only select repositories → ${esc(c.repo)}</b><br>
+          · Permissions → Repository permissions → <b>Contents: Read and write</b> (나머지는 그대로)<br>
+          · 만료 기간은 짧게(예: 90일) 두고 만료되면 다시 만드세요.<br>
+          토큰은 이 브라우저에만 저장되고 GitHub 외 다른 곳으로 보내지 않습니다. 공용 PC에서는 입력하지 말고, 쓰고 나면 「토큰 삭제」를 누르세요. 보기만 하는 기기에는 토큰이 필요 없습니다.
+        </div>
+      </div>
+
       <h2>목표 기준값</h2>
       <div class="tbl-wrap"><table><thead><tr><th class="l">지표</th><th>목표</th><th>방향</th></tr></thead>
         <tbody>${Object.entries(tg).map(([k, t]) => `<tr><td class="l">${t.label}</td><td><input data-t="${k}" type="number" step="${t.fmt === "%" ? 1 : 0.5}" value="${t.fmt === "%" ? Math.round(t.v * 100) : t.v}" style="width:90px"> ${t.fmt === "%" ? "%" : ""}</td><td class="muted">${t.low ? "낮을수록 좋음" : "높을수록 좋음"}</td></tr>`).join("")}</tbody></table></div>
       <h2>육각형 점수 기준 <span class="muted">0점 / 100점</span></h2>
       <div class="tbl-wrap"><table><thead><tr><th class="l">영역</th><th class="l">지표</th><th>0점</th><th>100점</th></tr></thead>
-        <tbody>${Object.entries(rd).map(([k, c]) => `<tr><td class="l"><b>${c.label}</b></td><td class="l">${c.metric}</td><td><input data-rz="${k}" type="number" step="0.05" value="${c.zero}" style="width:80px"></td><td><input data-rf="${k}" type="number" step="0.05" value="${c.full}" style="width:80px"></td></tr>`).join("")}
+        <tbody>${Object.entries(rd).map(([k, x]) => `<tr><td class="l"><b>${x.label}</b></td><td class="l">${x.metric}</td><td><input data-rz="${k}" type="number" step="0.05" value="${x.zero}" style="width:80px"></td><td><input data-rf="${k}" type="number" step="0.05" value="${x.full}" style="width:80px"></td></tr>`).join("")}
         <tr><td class="l"><b>목표선</b></td><td class="l">육각형 기준선 점수</td><td colspan="2"><input id="rTarget" type="number" value="${settings.radarTarget}" style="width:80px"></td></tr></tbody></table></div>
-      <p class="legend-note">기준값은 아마추어 핸디캡별 통계 경향을 참고한 가정값입니다(100점 ≈ 싱글~10 핸디캡, 0점 ≈ 초보). 비율은 0~1로 입력합니다(예: 0.7 = 70%).</p>
-      <div class="row" style="margin-top:10px"><button class="btn" id="bSaveSet" type="button">기준값 저장</button><button class="btn ghost" id="bResetSet" type="button">기본값으로</button></div>
+      <p class="legend-note">기준값은 아마추어 핸디캡별 통계 경향을 참고한 가정값입니다(100점 ≈ 싱글~10 핸디캡, 0점 ≈ 초보). 비율은 0~1로 입력합니다.</p>
+      <div class="row" style="margin-top:10px"><button class="btn" id="bSaveSet" type="button" ${G.canWrite() ? "" : "disabled"}>기준값 GitHub에 저장</button><button class="btn ghost" id="bResetSet" type="button">기본값 불러오기</button></div>
 
-      <h2>데이터</h2>
-      <div class="notice">입력한 라운드는 <b>이 브라우저에만</b> 저장됩니다. 다른 기기에서 보거나 백업하려면 내보내기 파일을 저장해 두세요. 내보낸 파일로 저장소의 <code>data/rounds.json</code>을 바꾸고 올리면 모든 기기의 기본 데이터가 됩니다.</div>
-      <div class="row" style="margin-top:10px">
-        <button class="btn" id="bExport" type="button">내보내기 (JSON)</button>
-        <label class="btn ghost" style="cursor:pointer">가져오기 (JSON)<input id="fImport" type="file" accept="application/json,.json" hidden></label>
-        <button class="btn danger" id="bReset" type="button">원본 데이터로 되돌리기</button>
-      </div>
-      <div id="resetBox" style="margin-top:10px"></div>
-      <p class="muted">현재 ${rounds.length}라운드 저장됨</p>
-    `;
-    document.getElementById("bSaveSet").addEventListener("click", () => {
-      app.querySelectorAll("[data-t]").forEach((el) => { const t = tg[el.dataset.t]; const v = Number(el.value); if (isNum(v)) t.v = t.fmt === "%" ? v / 100 : v; });
-      app.querySelectorAll("[data-rz]").forEach((el) => { const v = Number(el.value); if (isNum(v)) rd[el.dataset.rz].zero = v; });
-      app.querySelectorAll("[data-rf]").forEach((el) => { const v = Number(el.value); if (isNum(v)) rd[el.dataset.rf].full = v; });
-      const rt = Number(document.getElementById("rTarget").value);
+      <h2>백업</h2>
+      <div class="row"><button class="btn ghost" id="bExport" type="button">rounds.json 내려받기</button></div>
+      <p class="muted">현재 ${rounds.length}라운드 · GitHub 저장소의 커밋 기록에 모든 변경 이력이 남습니다.</p>`;
+    const $ = (s) => document.getElementById(s);
+    $("bTok").onclick = async () => {
+      const v = $("tok").value.trim();
+      if (!v) return toast("토큰을 입력하세요.");
+      G.setCfg({ token: v });
+      $("tok").value = "";
+      const t = await G.testToken();
+      toast(t.msg, 4000);
+      renderStatus();
+      settingsView();
+    };
+    $("bTest").onclick = async () => toast((await G.testToken()).msg, 4000);
+    $("bTokDel").onclick = () => { G.setCfg({ token: "" }); toast("이 기기에서 토큰을 지웠습니다."); renderStatus(); settingsView(); };
+    $("bSaveSet").onclick = async () => {
+      app.querySelectorAll("[data-t]").forEach((el) => { const t = tg[el.dataset.t]; const v = Number(el.value); if (el.value !== "" && isNum(v)) t.v = t.fmt === "%" ? v / 100 : v; });
+      app.querySelectorAll("[data-rz]").forEach((el) => { const v = Number(el.value); if (el.value !== "" && isNum(v)) rd[el.dataset.rz].zero = v; });
+      app.querySelectorAll("[data-rf]").forEach((el) => { const v = Number(el.value); if (el.value !== "" && isNum(v)) rd[el.dataset.rf].full = v; });
+      const rt = Number($("rTarget").value);
       if (isNum(rt)) settings.radarTarget = rt;
-      saveSettings();
-      toast("기준값을 저장했습니다.");
-    });
-    document.getElementById("bResetSet").addEventListener("click", () => { settings = structuredClone(S.DEFAULT_SETTINGS); store.del(KEY_SETTINGS); settingsView(); toast("기본값으로 되돌렸습니다."); });
-    document.getElementById("bExport").addEventListener("click", () => {
-      const blob = new Blob([JSON.stringify(S.byRecent(rounds).reverse(), null, 1)], { type: "application/json" });
+      try {
+        await G.update(() => settings, "기준값 변경", "data/settings.json");
+        toast("기준값을 GitHub에 저장했습니다.");
+      } catch (e) { toast(e.message, 6000); }
+    };
+    $("bResetSet").onclick = () => { settings = structuredClone(S.DEFAULT_SETTINGS); settingsView(); toast("기본값을 불러왔습니다. 저장하려면 「기준값 GitHub에 저장」을 누르세요."); };
+    $("bExport").onclick = () => {
       const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
+      a.href = URL.createObjectURL(new Blob([JSON.stringify(rounds, null, 1)], { type: "application/json" }));
       a.download = `rounds-${new Date().toISOString().slice(0, 10)}.json`;
       a.click();
       URL.revokeObjectURL(a.href);
-    });
-    document.getElementById("fImport").addEventListener("change", async (e) => {
-      const file = e.target.files[0];
-      if (!file) return;
-      try {
-        const data = JSON.parse(await file.text());
-        if (!Array.isArray(data) || !data.every((r) => r.date && r.course && Array.isArray(r.holes))) throw new Error("형식");
-        rounds = data.map((r, i) => ({ ...r, id: r.id || "r" + String(r.date).replaceAll("-", "") + "-i" + i }));
-        saveRounds();
-        toast(`${rounds.length}라운드를 가져왔습니다.`);
-        settingsView();
-      } catch {
-        toast("가져오기 실패: 라운드 JSON 형식이 아닙니다.");
-      }
-    });
-    document.getElementById("bReset").addEventListener("click", () => {
-      document.getElementById("resetBox").innerHTML = `<div class="notice">이 브라우저에 입력한 기록이 모두 지워지고 data/rounds.json으로 되돌아갑니다. 먼저 내보내기로 백업하세요. <button class="btn danger" id="bReset2" type="button">되돌리기 확인</button></div>`;
-      document.getElementById("bReset2").addEventListener("click", async () => {
-        rounds = await loadOriginal();
-        saveRounds();
-        toast("원본 데이터로 되돌렸습니다.");
-        settingsView();
-      });
-    });
+    };
   }
 
-  init().catch((e) => {
-    app.innerHTML = `<div class="notice">데이터를 불러오지 못했습니다. 로컬 파일(file://)로 열었다면 간단한 웹 서버로 열어 주세요. (${esc(e.message)})</div>`;
-  });
+  // ───────────── 시작 ─────────────
+  (async () => {
+    const cached = ls.get(KEY_CACHE);
+    if (Array.isArray(cached)) { rounds = cached; source = "cache"; }
+    window.addEventListener("hashchange", route);
+    if (rounds.length) route();
+    else app.innerHTML = `<p class="muted">데이터를 불러오는 중…</p>`;
+    await loadAll(true);
+    route();
+  })();
 })();

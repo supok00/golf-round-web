@@ -132,3 +132,41 @@ label.f input, label.f textarea { width: 100%; }
   .holes-in select { padding: 9px 2px; }
   .holes-in .hn { width: 28px; }
 }
+
+/* 데이터 상태 표시줄 */
+.status { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; font-size: 12px; color: rgba(255,255,255,.85); padding: 6px 0 8px; }
+.status .ok { color: #b9f3cf; font-weight: 700; }
+.status .muted { color: rgba(255,255,255,.6); }
+.status .link { color: #fff; }
+.link { background: none; border: none; padding: 0; font: inherit; color: var(--blue); text-decoration: underline; cursor: pointer; }
+.mt0 { margin-top: 0; }
+
+/* 홀 이동 버튼 */
+.holenav { display: grid; grid-template-columns: repeat(9, 1fr); gap: 6px; margin-top: 14px; }
+.hn-btn { border: 1px solid #cfd6d0; background: #fff; border-radius: 8px; padding: 6px 0; font: inherit; cursor: pointer; display: flex; flex-direction: column; align-items: center; line-height: 1.15; }
+.hn-btn span { font-weight: 800; font-size: 14px; }
+.hn-btn small { font-size: 11px; color: var(--ink-2); }
+.hn-btn.cur { outline: 3px solid var(--green); outline-offset: -1px; }
+.sc-1 { background: #fff3d6; }
+
+/* 홀 입력 카드 */
+.holecard { margin-top: 10px; }
+.hc-title { font-size: 20px; font-weight: 800; color: var(--green); }
+.fgroup { margin-top: 14px; }
+.fg-title { font-size: 12px; font-weight: 800; color: var(--green-2); margin-bottom: 6px; letter-spacing: 0; }
+.holecard .form { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); }
+.holecard label.f.key select { border-color: var(--green); border-width: 2px; font-weight: 800; }
+.holecard label.f.wide { grid-column: 1 / -1; }
+.holecard select, .holecard input { width: 100%; }
+.hint { font-size: 11px; font-weight: 500; color: var(--ink-3); }
+select:disabled { background: #eee; }
+
+/* 스코어카드 표 */
+.card-tbl th.l { white-space: nowrap; }
+.card-tbl td { min-width: 30px; }
+.card-tbl td.memo { white-space: normal; font-size: 12px; min-width: 60px; }
+@media (max-width: 600px) {
+  .holenav { gap: 4px; }
+  .hn-btn span { font-size: 13px; }
+  .holecard .form { grid-template-columns: 1fr 1fr; }
+}
