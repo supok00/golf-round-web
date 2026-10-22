@@ -584,7 +584,7 @@
       <div class="row" style="margin-top:10px"><button class="btn" id="bSaveSet" type="button" ${G.canWrite() ? "" : "disabled"}>기준값 GitHub에 저장</button><button class="btn ghost" id="bResetSet" type="button">기본값 불러오기</button></div>
 
       <h2>백업</h2>
-      <div class="row"><button class="btn ghost" id="bExport" type="button">rounds.json 내려받기</button></div>
+      ${native ? `<p class="muted">앱에서는 파일 내려받기가 안 됩니다. 백업은 웹 페이지에서 하거나 GitHub 저장소의 data/rounds.json을 쓰세요.</p>` : `<div class="row"><button class="btn ghost" id="bExport" type="button">rounds.json 내려받기</button></div>`}
       <p class="muted">현재 ${rounds.length}라운드 · GitHub 저장소의 커밋 기록에 모든 변경 이력이 남습니다.</p>`;
     const $ = (s) => document.getElementById(s);
     $("bTok").onclick = async () => {
@@ -611,13 +611,23 @@
       } catch (e) { toast(e.message, 6000); }
     };
     $("bResetSet").onclick = () => { settings = structuredClone(S.DEFAULT_SETTINGS); settingsView(); toast("기본값을 불러왔습니다. 저장하려면 「기준값 GitHub에 저장」을 누르세요."); };
-    $("bExport").onclick = () => {
+    if ($("bExport")) $("bExport").onclick = () => {
       const a = document.createElement("a");
       a.href = URL.createObjectURL(new Blob([JSON.stringify(rounds, null, 1)], { type: "application/json" }));
       a.download = `rounds-${new Date().toISOString().slice(0, 10)}.json`;
       a.click();
       URL.revokeObjectURL(a.href);
     };
+  }
+
+  // ───────────── 안드로이드 앱(Capacitor) ─────────────
+  // 뒤로 가기 버튼: 화면 이동 기록이 있으면 이전 화면, 없으면 앱 종료
+  const native = window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform();
+  if (native && window.Capacitor.Plugins.App) {
+    window.Capacitor.Plugins.App.addListener("backButton", ({ canGoBack }) => {
+      if (canGoBack && location.hash && location.hash !== "#/dashboard") history.back();
+      else window.Capacitor.Plugins.App.exitApp();
+    });
   }
 
   // ───────────── 시작 ─────────────

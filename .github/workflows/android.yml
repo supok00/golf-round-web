@@ -1,0 +1,64 @@
+# 웹 화면을 안드로이드 앱(APK)으로 감싸 Releases의 'apk' 항목에 올린다.
+# 데이터(data/) 변경으로는 다시 빌드하지 않는다 — 앱이 GitHub에서 최신 데이터를 직접 읽기 때문.
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+    paths: ["index.html", "css/**", "js/**", "app/**", ".github/workflows/android.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Capacitor 설치 및 웹 화면 복사
+        run: |
+          npm install --no-audit --no-fund
+          npm run prepare-www
+
+      - name: 안드로이드 프로젝트 생성
+        run: |
+          npx cap add android
+          npx capacitor-assets generate --android \
+            --iconBackgroundColor '#1e5e3b' --splashBackgroundColor '#1e5e3b'
+          npx cap sync android
+
+      - name: 버전 번호 (설치된 앱 위에 업데이트되도록 매번 증가)
+        run: |
+          sed -i "s/versionCode 1$/versionCode ${{ github.run_number }}/" android/app/build.gradle
+          sed -i "s/versionName \"1.0\"/versionName \"1.0.${{ github.run_number }}\"/" android/app/build.gradle
+          grep -E "versionCode|versionName" android/app/build.gradle
+
+      - name: APK 빌드 (고정 서명 키)
+        run: |
+          mkdir -p ~/.android && cp debug.keystore ~/.android/debug.keystore
+          cd android && ./gradlew --no-daemon assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk ../golf-round.apk
+
+      - name: Releases에 올리기
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view apk >/dev/null 2>&1 || gh release create apk \
+            --title "골프 라운드 안드로이드 앱" \
+            --notes "휴대폰에서 golf-round.apk를 내려받아 설치하세요. 웹 화면을 고치면 자동으로 새로 빌드됩니다."
+          gh release upload apk golf-round.apk --clobber
+          gh release edit apk --notes "휴대폰에서 golf-round.apk를 내려받아 설치하세요. 최근 빌드: 1.0.${{ github.run_number }} ($(date -u +%Y-%m-%d))"
