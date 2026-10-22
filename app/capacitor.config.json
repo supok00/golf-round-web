@@ -1,8 +1,0 @@
-{
-  "appId": "io.github.supok00.golfround",
-  "appName": "골프 라운드",
-  "webDir": "www",
-  "android": {
-    "backgroundColor": "#1e5e3b"
-  }
-}
