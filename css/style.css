@@ -170,3 +170,4 @@ select:disabled { background: #eee; }
   .hn-btn span { font-size: 13px; }
   .holecard .form { grid-template-columns: 1fr 1fr; }
 }
+.toast { white-space: pre-line; max-width: 92vw; }
