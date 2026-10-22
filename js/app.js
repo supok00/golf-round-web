@@ -119,7 +119,7 @@
     const [, tab = "dashboard", arg] = location.hash.split("?")[0].split("/");
     const active = tab === "round" || tab === "edit" ? "rounds" : tab;
     document.querySelectorAll("#tabs a").forEach((a) => a.classList.toggle("active", a.dataset.tab === active));
-    const views = { dashboard, input: () => inputView(null), edit: () => inputView(decodeURIComponent(arg || "")), rounds: roundsView, round: () => roundView(decodeURIComponent(arg || "")), stats: statsView, holes: holesView, detail: detailView, settings: settingsView };
+    const views = { dashboard, input: () => inputView(null), edit: () => inputView(decodeURIComponent(arg || "")), rounds: roundsView, round: () => roundView(decodeURIComponent(arg || "")), stats: statsView, holes: holesView, detail: detailView, guide: guideView, settings: settingsView };
     (views[tab] || dashboard)();
     window.scrollTo(0, 0);
   }
@@ -551,6 +551,13 @@
     chart("cFp", { type: "bar", data: { labels: D.fp.map((x) => x.l), datasets: [{ label: "1퍼트율", data: D.fp.map((x) => x.one), backgroundColor: "#2e7d5b" }, { label: "3퍼트율", data: D.fp.map((x) => x.three), backgroundColor: "#e5352b" }] }, options: baseOpts({ plugins: legendOn, scales: { y: { beginAtZero: true, ticks: { callback: (v) => Math.round(v * 100) + "%" }, ...noGrid }, x: noGrid } }), plugins: [valueLabels(pct)] });
   }
 
+  // ───────────── 사용자 가이드 ─────────────
+  const GUIDE = { app: "골프 라운드 분석", url: "supok00.github.io/golf-round-web", features: { filter: false, import: false, insights: false }, repos: ["golf-round-web", "mygolf", "golf-lounge"] };
+  function guideView() {
+    app.innerHTML = Guide.render(GUIDE);
+    Guide.bind(app);
+  }
+
   // ───────────── 설정·데이터 ─────────────
   function settingsView() {
     const c = G.cfg();
@@ -585,10 +592,9 @@
         <div id="syncBox" class="muted">확인 중…</div>
         <div class="row" style="margin-top:10px">
           <button class="btn ghost" id="bSyncCheck" type="button">다시 확인</button>
-          <button class="btn ghost" id="bSyncP" type="button" ${G.canWrite() ? "" : "disabled"}>${esc(G.PRIMARY.repo)} 기준으로 맞추기</button>
-          <button class="btn ghost" id="bSyncM" type="button" ${G.canWrite() ? "" : "disabled"}>${esc(G.MIRRORS[0].repo)} 기준으로 맞추기</button>
+          ${[G.PRIMARY, ...G.MIRRORS].map((r) => `<button class="btn ghost" data-sync="${esc(r.repo)}" type="button" ${G.canWrite() ? "" : "disabled"}>${esc(r.repo)} 기준으로 맞추기</button>`).join("")}
         </div>
-        <p class="legend-note">평소에는 저장할 때마다 자동으로 두 저장소에 같이 반영됩니다. 네트워크 오류 등으로 어긋났을 때만 맞추기를 누르세요. 맞추기는 한쪽 내용으로 다른 쪽을 덮어씁니다.</p>
+        <p class="legend-note">평소에는 저장할 때마다 자동으로 모든 저장소에 같이 반영됩니다. 네트워크 오류 등으로 어긋났을 때만 맞추기를 누르세요. 맞추기는 한쪽 내용으로 다른 쪽을 덮어씁니다.</p>
       </div>
 
       <h2>목표 기준값</h2>
@@ -634,8 +640,7 @@
         settingsView();
       } catch (e) { toast(e.message, 6000); }
     };
-    $("bSyncP").onclick = () => doSync("primary");
-    $("bSyncM").onclick = () => doSync("mirror");
+    app.querySelectorAll("[data-sync]").forEach((b) => (b.onclick = () => doSync(b.dataset.sync)));
     $("bTest").onclick = async () => toast((await G.testToken()).msg, 4000);
     $("bTokDel").onclick = () => { G.setCfg({ token: "" }); toast("이 기기에서 토큰을 지웠습니다."); renderStatus(); settingsView(); };
     $("bSaveSet").onclick = async () => {
