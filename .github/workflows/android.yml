@@ -5,7 +5,7 @@ name: Android APK
 on:
   push:
     branches: [main]
-    paths: ["index.html", "css/**", "js/**", "app/**", ".github/workflows/android.yml"]
+    paths: ["index.html", "css/**", "js/**", "icons/**", "manifest.webmanifest", "app/**", ".github/workflows/android.yml"]
   workflow_dispatch:
 
 permissions:
@@ -47,11 +47,48 @@ jobs:
           sed -i "s/versionName \"1.0\"/versionName \"1.0.${{ github.run_number }}\"/" android/app/build.gradle
           grep -E "versionCode|versionName" android/app/build.gradle
 
-      - name: APK 빌드 (고정 서명 키)
+      - name: 서명 키 준비
+        # 저장소 Secrets(ANDROID_KEYSTORE_B64 / ANDROID_KEYSTORE_PASSWORD)가 있으면 비공개 키로,
+        # 없으면 공개 저장소의 대체 키(fallback-release.p12)로 서명한다.
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |
-          mkdir -p ~/.android && cp debug.keystore ~/.android/debug.keystore
-          cd android && ./gradlew --no-daemon assembleDebug
-          cp app/build/outputs/apk/debug/app-debug.apk ../golf-round.apk
+          if [ -n "$KS_B64" ] && [ -n "$KS_PASS" ]; then
+            echo "$KS_B64" | base64 -d > release.p12
+            echo "KS_PASS=$KS_PASS" >> "$GITHUB_ENV"
+            echo "서명: 비공개 키(Secrets)"
+          else
+            cp fallback-release.p12 release.p12
+            echo "KS_PASS=golfround" >> "$GITHUB_ENV"
+            echo "::warning::Secrets가 없어 공개 대체 키로 서명합니다."
+          fi
+          cat >> android/app/build.gradle <<'GRADLE'
+
+          android {
+              signingConfigs {
+                  release {
+                      storeFile file("../../release.p12")
+                      storeType "pkcs12"
+                      storePassword System.getenv("KS_PASS")
+                      keyAlias "golfround"
+                      keyPassword System.getenv("KS_PASS")
+                  }
+              }
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.release
+                      debuggable false
+                  }
+              }
+          }
+          GRADLE
+
+      - name: APK 빌드 (릴리스)
+        run: |
+          cd android && ./gradlew --no-daemon assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk ../golf-round.apk
+          "$ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -1)/apksigner" verify --print-certs ../golf-round.apk | head -3
 
       - name: Releases에 올리기
         env:

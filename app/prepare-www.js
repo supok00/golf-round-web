@@ -5,7 +5,7 @@ const path = require("path");
 const ROOT = path.resolve(__dirname, "..");
 const WWW = path.join(__dirname, "www");
 fs.rmSync(WWW, { recursive: true, force: true });
-for (const p of ["index.html", "css", "js", "data"]) fs.cpSync(path.join(ROOT, p), path.join(WWW, p), { recursive: true });
+for (const p of ["index.html", "css", "js", "data", "icons", "manifest.webmanifest"]) fs.cpSync(path.join(ROOT, p), path.join(WWW, p), { recursive: true });
 
 const CHART_CDN = "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js";
 (async () => {

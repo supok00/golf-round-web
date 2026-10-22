@@ -555,6 +555,12 @@
     const c = G.cfg();
     const tg = settings.targets, rd = settings.radar;
     app.innerHTML = `
+      ${native ? "" : `<h2>휴대폰에 앱으로 설치</h2>
+      <div class="card">
+        ${installPrompt ? `<button class="btn" id="bInstall" type="button">앱 설치</button>` : `<p class="muted mt0">${window.matchMedia("(display-mode: standalone)").matches ? "앱으로 실행 중입니다." : "안드로이드 Chrome: 오른쪽 위 ⋮ 메뉴 → <b>앱 설치</b>(또는 홈 화면에 추가)를 누르세요."}</p>`}
+        <p class="legend-note">설치하면 홈 화면 아이콘으로 전체 화면에서 열리고, 인터넷이 없어도 마지막으로 받은 기록을 볼 수 있습니다. APK와 달리 Play 프로텍트 경고가 없습니다.</p>
+      </div>`}
+
       <h2>GitHub 연결</h2>
       <div class="card">
         <p class="muted mt0">데이터 저장 위치: <b>${esc(c.owner)}/${esc(c.repo)}</b> · ${esc(c.branch)} · ${esc(c.path)}</p>
@@ -587,6 +593,7 @@
       ${native ? `<p class="muted">앱에서는 파일 내려받기가 안 됩니다. 백업은 웹 페이지에서 하거나 GitHub 저장소의 data/rounds.json을 쓰세요.</p>` : `<div class="row"><button class="btn ghost" id="bExport" type="button">rounds.json 내려받기</button></div>`}
       <p class="muted">현재 ${rounds.length}라운드 · GitHub 저장소의 커밋 기록에 모든 변경 이력이 남습니다.</p>`;
     const $ = (s) => document.getElementById(s);
+    if ($("bInstall")) $("bInstall").onclick = async () => { installPrompt.prompt(); await installPrompt.userChoice; installPrompt = null; settingsView(); };
     $("bTok").onclick = async () => {
       const v = $("tok").value.trim();
       if (!v) return toast("토큰을 입력하세요.");
@@ -629,6 +636,17 @@
       else window.Capacitor.Plugins.App.exitApp();
     });
   }
+
+  // ───────────── 설치형 웹앱(PWA) ─────────────
+  let installPrompt = null;
+  if (!native && "serviceWorker" in navigator && location.protocol === "https:") {
+    navigator.serviceWorker.register("sw.js").catch(() => { /* 지원하지 않는 브라우저 */ });
+  }
+  window.addEventListener("beforeinstallprompt", (e) => {
+    e.preventDefault();
+    installPrompt = e;
+    if (location.hash.startsWith("#/settings")) settingsView();
+  });
 
   // ───────────── 시작 ─────────────
   (async () => {
